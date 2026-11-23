@@ -1,0 +1,44 @@
+{
+  "project_name": "sector_paper_sim",
+  "upstream_paths": {
+    "tdx_daily_dir": "D:/VibeCoding/Quant/QuantData/raw/tdx/vipdoc_parsed",
+    "dividend_events_file": "D:/VibeCoding/Quant/QuantData/reference/etf/corporate_actions/20261120/watchlist_dividend_events.json",
+    "watchlist_file": "D:/VibeCoding/Quant/sector_radar/project_content/config/watchlist.json"
+  },
+  "account_defaults": {
+    "initial_capital": 100000.0,
+    "sector_max_weight": 0.1666667,
+    "lot_size": 100,
+    "commission_rate": 0.0002,
+    "min_commission": 0.1,
+    "stamp_duty_rate": 0.0,
+    "dividend_reinvest": true
+  },
+  "strategies": {
+    "turtle": {
+      "entry_lookback": 55,
+      "exit_lookback": 20,
+      "atr_window": 20
+    },
+    "grid": {
+      "step_mode": "atr20_locked",
+      "atr_window": 20,
+      "step_min": 0.02,
+      "step_max": 0.05,
+      "grid_levels_each_side": 4,
+      "total_slices": 5,
+      "initial_slices": 2
+    }
+  },
+  "universe": {
+    "benchmark": "159330.SZ",
+    "sectors": [
+      "512400.SH",
+      "510720.SH",
+      "159622.SZ",
+      "515790.SH",
+      "512480.SH",
+      "512880.SH"
+    ]
+  }
+}
