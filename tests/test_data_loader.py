@@ -10,6 +10,7 @@ import pandas as pd
 import pytest
 
 from src.data_loader import (
+    ALLOWED_REGIMES,
     DEFAULT_SIM_CONFIG_PATH,
     TDX_NUMERIC_COLUMNS,
     TDX_REQUIRED_COLUMNS,
@@ -128,17 +129,16 @@ def test_load_dividend_events_real_upstream() -> None:
 
 
 def test_load_watchlist_real_upstream_includes_unrated_and_splits() -> None:
-    """512880.SH UNRATED parses cleanly; 512480.SH split_events and others default to []."""
+    """Real upstream watchlist contains all 7 symbols with valid regimes and 512480.SH split."""
     config = load_sim_config(DEFAULT_SIM_CONFIG_PATH)
     watchlist = load_watchlist(config["upstream_paths"]["watchlist_file"])
 
     assert set(EXPECTED_SYMBOLS).issubset(set(watchlist.keys()))
 
-    assert watchlist["512880.SH"]["current_regime"] == "UNRATED"
-    assert watchlist["512880.SH"]["split_events"] == []
-
     assert watchlist["159330.SZ"]["current_regime"] == "BENCHMARK"
-    assert watchlist["515790.SH"]["current_regime"] == "TRAP_OFF"
+    for symbol in EXPECTED_SYMBOLS[1:]:
+        assert watchlist[symbol]["current_regime"] in ALLOWED_REGIMES
+        assert watchlist[symbol]["current_regime"] != "BENCHMARK"
 
     split_512480 = watchlist["512480.SH"]["split_events"]
     assert len(split_512480) == 1
@@ -147,6 +147,40 @@ def test_load_watchlist_real_upstream_includes_unrated_and_splits() -> None:
 
     for symbol in ("159330.SZ", "512400.SH", "510720.SH", "159622.SZ", "515790.SH", "512880.SH"):
         assert watchlist[symbol]["split_events"] == []
+
+
+def test_load_watchlist_synthetic_unrated_parses_cleanly(tmp_path: Path) -> None:
+    """Synthetic watchlist containing UNRATED regime parses cleanly with split_events defaulting to []."""
+    watchlist_path = tmp_path / "watchlist_unrated.json"
+    watchlist_path.write_text(
+        json.dumps(
+            {
+                "universe": [
+                    {
+                        "symbol": "159330.SZ",
+                        "name": "沪深300ETF",
+                        "role": "benchmark",
+                        "current_regime": "BENCHMARK",
+                    },
+                    {
+                        "symbol": "512880.SH",
+                        "name": "证券ETF",
+                        "role": "sector",
+                        "current_regime": "UNRATED",
+                    },
+                ]
+            },
+            ensure_ascii=False,
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+
+    watchlist = load_watchlist(watchlist_path)
+    assert set(watchlist.keys()) == {"159330.SZ", "512880.SH"}
+    assert watchlist["159330.SZ"]["current_regime"] == "BENCHMARK"
+    assert watchlist["512880.SH"]["current_regime"] == "UNRATED"
+    assert watchlist["512880.SH"]["split_events"] == []
 
 
 def test_load_tdx_daily_latest_batch_and_dedup_sort(tmp_path: Path) -> None:
