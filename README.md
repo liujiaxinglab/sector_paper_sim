@@ -57,7 +57,30 @@ C:\Users\jxing\.conda\envs\quant\python.exe -m pytest tests/test_upstream_readon
 
 # 运行上游只读连通性诊断摘要
 C:\Users\jxing\.conda\envs\quant\python.exe tests/test_upstream_readonly.py
+
+# 运行全量单元测试
+C:\Users\jxing\.conda\envs\quant\python.exe -m pytest tests/ -v
 ```
+
+### 每周五盘后增量运行（CLI 唯一入口）
+
+完成本地 TDX 日线同步后，每周五盘后执行一条命令即可自动补算新交易日、锁定下周路由并落盘 `output/state.json`、`output/trades.csv`、`output/nav_weekly.md`：
+
+```powershell
+# 例行周五盘后增量更新（已有 output/state.json 时自动推进新交易日并刷新下周锁定路由）
+C:\Users\jxing\.conda\envs\quant\python.exe -m src.run_weekly_sim
+
+# 仅预演并打印五账户汇总（不写盘）
+C:\Users\jxing\.conda\envs\quant\python.exe -m src.run_weekly_sim --dry-run
+
+# 首次基线建盘（仅在无 output/state.json 时生效；默认取共同最新交易日）
+C:\Users\jxing\.conda\envs\quant\python.exe -m src.run_weekly_sim --start-date 2026-11-20
+
+# 可选参数：自定义配置/输出目录/截止日，或在确认滞后警告后强制推进
+C:\Users\jxing\.conda\envs\quant\python.exe -m src.run_weekly_sim --config project_content/config/sim_config.json --output-dir output --end-date 2026-11-27 --allow-lag
+```
+
+> **防未来函数说明**：增量推进新交易日时，引擎严格使用上周落盘的 `state.json["next_effective_regime"]`；待本周交易日推进完成后，再读取最新 `watchlist.json` 刷新下周锁定路由。若周五盘后先跑完脚本、随后更新了 `sector_radar` 的 `watchlist.json`，可同日重跑 `python -m src.run_weekly_sim` 幂等刷新下周锁定路由与周报（不会重复推进交易日或追加重复历史行）。
 
 ## 5. 文档导航
 

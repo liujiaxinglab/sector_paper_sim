@@ -1,0 +1,1182 @@
+{
+  "schema_version": "1.0.0",
+  "start_date": "2026-11-20",
+  "last_processed_date": "2026-11-20",
+  "trading_days_processed": 1,
+  "config_snapshot": {
+    "account_defaults": {
+      "initial_capital": 100000.0,
+      "sector_max_weight": 0.1666667,
+      "lot_size": 100,
+      "commission_rate": 0.0002,
+      "min_commission": 0.1,
+      "stamp_duty_rate": 0.0,
+      "dividend_reinvest": true
+    },
+    "strategies": {
+      "turtle": {
+        "entry_lookback": 55,
+        "exit_lookback": 20,
+        "atr_window": 20,
+        "risk_fraction": 0.01
+      },
+      "grid": {
+        "step_mode": "atr20_locked",
+        "atr_window": 20,
+        "step_min": 0.02,
+        "step_max": 0.05,
+        "grid_levels_each_side": 4,
+        "total_slices": 5,
+        "initial_slices": 2
+      }
+    },
+    "universe": {
+      "benchmark": "159330.SZ",
+      "sectors": [
+        "159622.SZ",
+        "510720.SH",
+        "512400.SH",
+        "512480.SH",
+        "512880.SH",
+        "515790.SH"
+      ]
+    }
+  },
+  "last_known_closes": {
+    "159330.SZ": 1.242,
+    "159622.SZ": 1.035,
+    "510720.SH": 1.008,
+    "512400.SH": 1.242,
+    "512480.SH": 0.745,
+    "512880.SH": 0.981,
+    "515790.SH": 0.635
+  },
+  "excess_history": [
+    {
+      "date": "2026-11-20",
+      "A_vs_B1": 0.0,
+      "A_vs_B2": 7.933320000008681e-05,
+      "A_vs_C": 0.008804520600000143,
+      "A_vs_D": -0.0022182732000000094
+    }
+  ],
+  "accounts": {
+    "A": {
+      "account_id": "A",
+      "account_type": "routed",
+      "initial_capital": 100000.0,
+      "cash": 100000.0,
+      "equity": 100000.0,
+      "nav": 1.0,
+      "peak_equity": 100000.0,
+      "max_drawdown": 0.0,
+      "initialized": false,
+      "positions": {
+        "159622.SZ": {
+          "shares": 0,
+          "avg_cost": 0.0
+        },
+        "510720.SH": {
+          "shares": 0,
+          "avg_cost": 0.0
+        },
+        "512400.SH": {
+          "shares": 0,
+          "avg_cost": 0.0
+        },
+        "512480.SH": {
+          "shares": 0,
+          "avg_cost": 0.0
+        },
+        "512880.SH": {
+          "shares": 0,
+          "avg_cost": 0.0
+        },
+        "515790.SH": {
+          "shares": 0,
+          "avg_cost": 0.0
+        }
+      },
+      "symbol_states": {
+        "159622.SZ": {
+          "raw_regime": "TRANSITION",
+          "effective_regime": "TRANSITION",
+          "position_mode": null,
+          "grid": null,
+          "last_indicators": {
+            "as_of": "2026-11-20",
+            "prev_55d_high": 1.241,
+            "prev_20d_low": 1.05,
+            "atr20": 0.03795
+          }
+        },
+        "510720.SH": {
+          "raw_regime": "TRANSITION",
+          "effective_regime": "TRANSITION",
+          "position_mode": null,
+          "grid": null,
+          "last_indicators": {
+            "as_of": "2026-11-20",
+            "prev_55d_high": 1.100997152071,
+            "prev_20d_low": 0.988943141153,
+            "atr20": 0.016359940358
+          }
+        },
+        "512400.SH": {
+          "raw_regime": "TRANSITION",
+          "effective_regime": "TRANSITION",
+          "position_mode": null,
+          "grid": null,
+          "last_indicators": {
+            "as_of": "2026-11-20",
+            "prev_55d_high": 1.905296685955,
+            "prev_20d_low": 1.255,
+            "atr20": 0.0474
+          }
+        },
+        "512480.SH": {
+          "raw_regime": "TRANSITION",
+          "effective_regime": "TRANSITION",
+          "position_mode": null,
+          "grid": null,
+          "last_indicators": {
+            "as_of": "2026-11-20",
+            "prev_55d_high": 1.079,
+            "prev_20d_low": 0.694,
+            "atr20": 0.04375
+          }
+        },
+        "512880.SH": {
+          "raw_regime": "TRANSITION",
+          "effective_regime": "TRANSITION",
+          "position_mode": null,
+          "grid": null,
+          "last_indicators": {
+            "as_of": "2026-11-20",
+            "prev_55d_high": 1.117,
+            "prev_20d_low": 0.959,
+            "atr20": 0.01785
+          }
+        },
+        "515790.SH": {
+          "raw_regime": "TRAP_OFF",
+          "effective_regime": "TRAP_OFF",
+          "position_mode": null,
+          "grid": null,
+          "last_indicators": {
+            "as_of": "2026-11-20",
+            "prev_55d_high": 0.855,
+            "prev_20d_low": 0.648,
+            "atr20": 0.0242
+          }
+        }
+      },
+      "trades": [],
+      "corporate_actions": [],
+      "daily_records": [
+        {
+          "date": "2026-11-20",
+          "cash": 100000.0,
+          "market_value": 0.0,
+          "equity": 100000.0,
+          "nav": 1.0,
+          "daily_return": 0.0,
+          "cum_return": 0.0,
+          "peak_equity": 100000.0,
+          "drawdown": 0.0,
+          "max_drawdown": 0.0,
+          "positions_count": 0,
+          "trades_today": 0
+        }
+      ]
+    },
+    "B1": {
+      "account_id": "B1",
+      "account_type": "pure_turtle",
+      "initial_capital": 100000.0,
+      "cash": 100000.0,
+      "equity": 100000.0,
+      "nav": 1.0,
+      "peak_equity": 100000.0,
+      "max_drawdown": 0.0,
+      "initialized": false,
+      "positions": {
+        "159622.SZ": {
+          "shares": 0,
+          "avg_cost": 0.0
+        },
+        "510720.SH": {
+          "shares": 0,
+          "avg_cost": 0.0
+        },
+        "512400.SH": {
+          "shares": 0,
+          "avg_cost": 0.0
+        },
+        "512480.SH": {
+          "shares": 0,
+          "avg_cost": 0.0
+        },
+        "512880.SH": {
+          "shares": 0,
+          "avg_cost": 0.0
+        },
+        "515790.SH": {
+          "shares": 0,
+          "avg_cost": 0.0
+        }
+      },
+      "symbol_states": {
+        "159622.SZ": {
+          "raw_regime": "TREND_UP",
+          "effective_regime": "TREND_UP",
+          "position_mode": null,
+          "grid": null,
+          "last_indicators": {
+            "as_of": "2026-11-20",
+            "prev_55d_high": 1.241,
+            "prev_20d_low": 1.05,
+            "atr20": 0.03795
+          }
+        },
+        "510720.SH": {
+          "raw_regime": "TREND_UP",
+          "effective_regime": "TREND_UP",
+          "position_mode": null,
+          "grid": null,
+          "last_indicators": {
+            "as_of": "2026-11-20",
+            "prev_55d_high": 1.100997152071,
+            "prev_20d_low": 0.988943141153,
+            "atr20": 0.016359940358
+          }
+        },
+        "512400.SH": {
+          "raw_regime": "TREND_UP",
+          "effective_regime": "TREND_UP",
+          "position_mode": null,
+          "grid": null,
+          "last_indicators": {
+            "as_of": "2026-11-20",
+            "prev_55d_high": 1.905296685955,
+            "prev_20d_low": 1.255,
+            "atr20": 0.0474
+          }
+        },
+        "512480.SH": {
+          "raw_regime": "TREND_UP",
+          "effective_regime": "TREND_UP",
+          "position_mode": null,
+          "grid": null,
+          "last_indicators": {
+            "as_of": "2026-11-20",
+            "prev_55d_high": 1.079,
+            "prev_20d_low": 0.694,
+            "atr20": 0.04375
+          }
+        },
+        "512880.SH": {
+          "raw_regime": "TREND_UP",
+          "effective_regime": "TREND_UP",
+          "position_mode": null,
+          "grid": null,
+          "last_indicators": {
+            "as_of": "2026-11-20",
+            "prev_55d_high": 1.117,
+            "prev_20d_low": 0.959,
+            "atr20": 0.01785
+          }
+        },
+        "515790.SH": {
+          "raw_regime": "TREND_UP",
+          "effective_regime": "TREND_UP",
+          "position_mode": null,
+          "grid": null,
+          "last_indicators": {
+            "as_of": "2026-11-20",
+            "prev_55d_high": 0.855,
+            "prev_20d_low": 0.648,
+            "atr20": 0.0242
+          }
+        }
+      },
+      "trades": [],
+      "corporate_actions": [],
+      "daily_records": [
+        {
+          "date": "2026-11-20",
+          "cash": 100000.0,
+          "market_value": 0.0,
+          "equity": 100000.0,
+          "nav": 1.0,
+          "daily_return": 0.0,
+          "cum_return": 0.0,
+          "peak_equity": 100000.0,
+          "drawdown": 0.0,
+          "max_drawdown": 0.0,
+          "positions_count": 0,
+          "trades_today": 0
+        }
+      ]
+    },
+    "B2": {
+      "account_id": "B2",
+      "account_type": "pure_grid",
+      "initial_capital": 100000.0,
+      "cash": 60325.46667999998,
+      "equity": 99992.06667999999,
+      "nav": 0.9999206667999999,
+      "peak_equity": 100000.0,
+      "max_drawdown": -7.933320000008681e-05,
+      "initialized": false,
+      "positions": {
+        "159622.SZ": {
+          "shares": 6400,
+          "avg_cost": 1.035207
+        },
+        "510720.SH": {
+          "shares": 6600,
+          "avg_cost": 1.0082016
+        },
+        "512400.SH": {
+          "shares": 5300,
+          "avg_cost": 1.2422484
+        },
+        "512480.SH": {
+          "shares": 8900,
+          "avg_cost": 0.7451490000000001
+        },
+        "512880.SH": {
+          "shares": 6700,
+          "avg_cost": 0.9811962000000001
+        },
+        "515790.SH": {
+          "shares": 10400,
+          "avg_cost": 0.635127
+        }
+      },
+      "symbol_states": {
+        "159622.SZ": {
+          "raw_regime": "RANGE_GRID",
+          "effective_regime": "RANGE_GRID",
+          "position_mode": "RANGE_GRID",
+          "grid": {
+            "anchor_price": 1.035,
+            "step": 0.03666666666666667,
+            "slice_budget": 3333.3340000000003,
+            "total_slices": 5,
+            "initial_slices": 2,
+            "initialized_date": "2026-11-20",
+            "pending_orders": [
+              {
+                "side": "BUY",
+                "level": -3,
+                "price": 0.9252734783333333,
+                "shares": null,
+                "budget": 3333.3340000000003
+              },
+              {
+                "side": "BUY",
+                "level": -2,
+                "price": 0.9604915,
+                "shares": null,
+                "budget": 3333.3340000000003
+              },
+              {
+                "side": "BUY",
+                "level": -1,
+                "price": 0.99705,
+                "shares": null,
+                "budget": 3333.3340000000003
+              },
+              {
+                "side": "SELL",
+                "level": 1,
+                "price": 1.0729499999999998,
+                "shares": 3200,
+                "budget": null
+              },
+              {
+                "side": "SELL",
+                "level": 2,
+                "price": 1.1122914999999998,
+                "shares": 3200,
+                "budget": null
+              }
+            ]
+          },
+          "last_indicators": {
+            "as_of": "2026-11-20",
+            "prev_55d_high": 1.241,
+            "prev_20d_low": 1.05,
+            "atr20": 0.03795
+          }
+        },
+        "510720.SH": {
+          "raw_regime": "RANGE_GRID",
+          "effective_regime": "RANGE_GRID",
+          "position_mode": "RANGE_GRID",
+          "grid": {
+            "anchor_price": 1.008,
+            "step": 0.02,
+            "slice_budget": 3333.3340000000003,
+            "total_slices": 5,
+            "initial_slices": 2,
+            "initialized_date": "2026-11-20",
+            "pending_orders": [
+              {
+                "side": "BUY",
+                "level": -3,
+                "price": 0.948721536,
+                "shares": null,
+                "budget": 3333.3340000000003
+              },
+              {
+                "side": "BUY",
+                "level": -2,
+                "price": 0.9680831999999999,
+                "shares": null,
+                "budget": 3333.3340000000003
+              },
+              {
+                "side": "BUY",
+                "level": -1,
+                "price": 0.9878399999999999,
+                "shares": null,
+                "budget": 3333.3340000000003
+              },
+              {
+                "side": "SELL",
+                "level": 1,
+                "price": 1.02816,
+                "shares": 3300,
+                "budget": null
+              },
+              {
+                "side": "SELL",
+                "level": 2,
+                "price": 1.0487232,
+                "shares": 3300,
+                "budget": null
+              }
+            ]
+          },
+          "last_indicators": {
+            "as_of": "2026-11-20",
+            "prev_55d_high": 1.100997152071,
+            "prev_20d_low": 0.988943141153,
+            "atr20": 0.016359940358
+          }
+        },
+        "512400.SH": {
+          "raw_regime": "RANGE_GRID",
+          "effective_regime": "RANGE_GRID",
+          "position_mode": "RANGE_GRID",
+          "grid": {
+            "anchor_price": 1.242,
+            "step": 0.03816425120772947,
+            "slice_budget": 3333.3340000000003,
+            "total_slices": 5,
+            "initial_slices": 2,
+            "initialized_date": "2026-11-20",
+            "pending_orders": [
+              {
+                "side": "BUY",
+                "level": -3,
+                "price": 1.1051579179444093,
+                "shares": null,
+                "budget": 3333.3340000000003
+              },
+              {
+                "side": "BUY",
+                "level": -2,
+                "price": 1.1490089855072463,
+                "shares": null,
+                "budget": 3333.3340000000003
+              },
+              {
+                "side": "BUY",
+                "level": -1,
+                "price": 1.1945999999999999,
+                "shares": null,
+                "budget": 3333.3340000000003
+              },
+              {
+                "side": "SELL",
+                "level": 1,
+                "price": 1.2893999999999999,
+                "shares": 2600,
+                "budget": null
+              },
+              {
+                "side": "SELL",
+                "level": 2,
+                "price": 1.338608985507246,
+                "shares": 2700,
+                "budget": null
+              }
+            ]
+          },
+          "last_indicators": {
+            "as_of": "2026-11-20",
+            "prev_55d_high": 1.905296685955,
+            "prev_20d_low": 1.255,
+            "atr20": 0.0474
+          }
+        },
+        "512480.SH": {
+          "raw_regime": "RANGE_GRID",
+          "effective_regime": "RANGE_GRID",
+          "position_mode": "RANGE_GRID",
+          "grid": {
+            "anchor_price": 0.745,
+            "step": 0.05,
+            "slice_budget": 3333.3340000000003,
+            "total_slices": 5,
+            "initial_slices": 2,
+            "initialized_date": "2026-11-20",
+            "pending_orders": [
+              {
+                "side": "BUY",
+                "level": -3,
+                "price": 0.6387443749999999,
+                "shares": null,
+                "budget": 3333.3340000000003
+              },
+              {
+                "side": "BUY",
+                "level": -2,
+                "price": 0.6723625,
+                "shares": null,
+                "budget": 3333.3340000000003
+              },
+              {
+                "side": "BUY",
+                "level": -1,
+                "price": 0.70775,
+                "shares": null,
+                "budget": 3333.3340000000003
+              },
+              {
+                "side": "SELL",
+                "level": 1,
+                "price": 0.78225,
+                "shares": 4400,
+                "budget": null
+              },
+              {
+                "side": "SELL",
+                "level": 2,
+                "price": 0.8213625,
+                "shares": 4500,
+                "budget": null
+              }
+            ]
+          },
+          "last_indicators": {
+            "as_of": "2026-11-20",
+            "prev_55d_high": 1.079,
+            "prev_20d_low": 0.694,
+            "atr20": 0.04375
+          }
+        },
+        "512880.SH": {
+          "raw_regime": "RANGE_GRID",
+          "effective_regime": "RANGE_GRID",
+          "position_mode": "RANGE_GRID",
+          "grid": {
+            "anchor_price": 0.981,
+            "step": 0.02,
+            "slice_budget": 3333.3340000000003,
+            "total_slices": 5,
+            "initial_slices": 2,
+            "initialized_date": "2026-11-20",
+            "pending_orders": [
+              {
+                "side": "BUY",
+                "level": -3,
+                "price": 0.9233093519999999,
+                "shares": null,
+                "budget": 3333.3340000000003
+              },
+              {
+                "side": "BUY",
+                "level": -2,
+                "price": 0.9421523999999999,
+                "shares": null,
+                "budget": 3333.3340000000003
+              },
+              {
+                "side": "BUY",
+                "level": -1,
+                "price": 0.96138,
+                "shares": null,
+                "budget": 3333.3340000000003
+              },
+              {
+                "side": "SELL",
+                "level": 1,
+                "price": 1.00062,
+                "shares": 3300,
+                "budget": null
+              },
+              {
+                "side": "SELL",
+                "level": 2,
+                "price": 1.0206324,
+                "shares": 3400,
+                "budget": null
+              }
+            ]
+          },
+          "last_indicators": {
+            "as_of": "2026-11-20",
+            "prev_55d_high": 1.117,
+            "prev_20d_low": 0.959,
+            "atr20": 0.01785
+          }
+        },
+        "515790.SH": {
+          "raw_regime": "RANGE_GRID",
+          "effective_regime": "RANGE_GRID",
+          "position_mode": "RANGE_GRID",
+          "grid": {
+            "anchor_price": 0.635,
+            "step": 0.03811023622047244,
+            "slice_budget": 3333.3340000000003,
+            "total_slices": 5,
+            "initial_slices": 2,
+            "initialized_date": "2026-11-20",
+            "pending_orders": [
+              {
+                "side": "BUY",
+                "level": -3,
+                "price": 0.5651316553090707,
+                "shares": null,
+                "budget": 3333.3340000000003
+              },
+              {
+                "side": "BUY",
+                "level": -2,
+                "price": 0.5875222677165355,
+                "shares": null,
+                "budget": 3333.3340000000003
+              },
+              {
+                "side": "BUY",
+                "level": -1,
+                "price": 0.6108,
+                "shares": null,
+                "budget": 3333.3340000000003
+              },
+              {
+                "side": "SELL",
+                "level": 1,
+                "price": 0.6592,
+                "shares": 5200,
+                "budget": null
+              },
+              {
+                "side": "SELL",
+                "level": 2,
+                "price": 0.6843222677165354,
+                "shares": 5200,
+                "budget": null
+              }
+            ]
+          },
+          "last_indicators": {
+            "as_of": "2026-11-20",
+            "prev_55d_high": 0.855,
+            "prev_20d_low": 0.648,
+            "atr20": 0.0242
+          }
+        }
+      },
+      "trades": [
+        {
+          "trade_id": 1,
+          "date": "2026-11-20",
+          "account": "B2",
+          "symbol": "159622.SZ",
+          "action": "GRID_INIT_BUY",
+          "side": "BUY",
+          "shares": 6400,
+          "price": 1.035,
+          "notional": 6624.0,
+          "commission": 1.3248,
+          "stamp_duty": 0.0,
+          "net_cash_flow": -6625.3248,
+          "regime": "RANGE_GRID",
+          "trigger_price": 1.035,
+          "grid_level": 0,
+          "note": "anchor=1.035000,step=0.036667"
+        },
+        {
+          "trade_id": 2,
+          "date": "2026-11-20",
+          "account": "B2",
+          "symbol": "510720.SH",
+          "action": "GRID_INIT_BUY",
+          "side": "BUY",
+          "shares": 6600,
+          "price": 1.008,
+          "notional": 6652.8,
+          "commission": 1.3305600000000002,
+          "stamp_duty": 0.0,
+          "net_cash_flow": -6654.1305600000005,
+          "regime": "RANGE_GRID",
+          "trigger_price": 1.008,
+          "grid_level": 0,
+          "note": "anchor=1.008000,step=0.020000"
+        },
+        {
+          "trade_id": 3,
+          "date": "2026-11-20",
+          "account": "B2",
+          "symbol": "512400.SH",
+          "action": "GRID_INIT_BUY",
+          "side": "BUY",
+          "shares": 5300,
+          "price": 1.242,
+          "notional": 6582.6,
+          "commission": 1.3165200000000001,
+          "stamp_duty": 0.0,
+          "net_cash_flow": -6583.916520000001,
+          "regime": "RANGE_GRID",
+          "trigger_price": 1.242,
+          "grid_level": 0,
+          "note": "anchor=1.242000,step=0.038164"
+        },
+        {
+          "trade_id": 4,
+          "date": "2026-11-20",
+          "account": "B2",
+          "symbol": "512480.SH",
+          "action": "GRID_INIT_BUY",
+          "side": "BUY",
+          "shares": 8900,
+          "price": 0.745,
+          "notional": 6630.5,
+          "commission": 1.3261,
+          "stamp_duty": 0.0,
+          "net_cash_flow": -6631.8261,
+          "regime": "RANGE_GRID",
+          "trigger_price": 0.745,
+          "grid_level": 0,
+          "note": "anchor=0.745000,step=0.050000"
+        },
+        {
+          "trade_id": 5,
+          "date": "2026-11-20",
+          "account": "B2",
+          "symbol": "512880.SH",
+          "action": "GRID_INIT_BUY",
+          "side": "BUY",
+          "shares": 6700,
+          "price": 0.981,
+          "notional": 6572.7,
+          "commission": 1.31454,
+          "stamp_duty": 0.0,
+          "net_cash_flow": -6574.01454,
+          "regime": "RANGE_GRID",
+          "trigger_price": 0.981,
+          "grid_level": 0,
+          "note": "anchor=0.981000,step=0.020000"
+        },
+        {
+          "trade_id": 6,
+          "date": "2026-11-20",
+          "account": "B2",
+          "symbol": "515790.SH",
+          "action": "GRID_INIT_BUY",
+          "side": "BUY",
+          "shares": 10400,
+          "price": 0.635,
+          "notional": 6604.0,
+          "commission": 1.3208,
+          "stamp_duty": 0.0,
+          "net_cash_flow": -6605.3208,
+          "regime": "RANGE_GRID",
+          "trigger_price": 0.635,
+          "grid_level": 0,
+          "note": "anchor=0.635000,step=0.038110"
+        }
+      ],
+      "corporate_actions": [],
+      "daily_records": [
+        {
+          "date": "2026-11-20",
+          "cash": 60325.46667999998,
+          "market_value": 39666.6,
+          "equity": 99992.06667999999,
+          "nav": 0.9999206667999999,
+          "daily_return": -7.933320000008681e-05,
+          "cum_return": -7.933320000008681e-05,
+          "peak_equity": 100000.0,
+          "drawdown": -7.933320000008681e-05,
+          "max_drawdown": -7.933320000008681e-05,
+          "positions_count": 6,
+          "trades_today": 6
+        }
+      ]
+    },
+    "C": {
+      "account_id": "C",
+      "account_type": "sector_equal_bh",
+      "initial_capital": 100000.0,
+      "cash": 219.74793999999383,
+      "equity": 99119.54793999999,
+      "nav": 0.9911954793999999,
+      "peak_equity": 100000.0,
+      "max_drawdown": -0.008804520600000143,
+      "initialized": true,
+      "positions": {
+        "159622.SZ": {
+          "shares": 15700,
+          "avg_cost": 1.0582116
+        },
+        "510720.SH": {
+          "shares": 16500,
+          "avg_cost": 1.0092017999999998
+        },
+        "512400.SH": {
+          "shares": 13400,
+          "avg_cost": 1.240248
+        },
+        "512480.SH": {
+          "shares": 21900,
+          "avg_cost": 0.7601519999999999
+        },
+        "512880.SH": {
+          "shares": 17000,
+          "avg_cost": 0.9781955999999999
+        },
+        "515790.SH": {
+          "shares": 25800,
+          "avg_cost": 0.6441288000000001
+        }
+      },
+      "symbol_states": {
+        "159622.SZ": {
+          "raw_regime": "BUY_AND_HOLD",
+          "effective_regime": "BUY_AND_HOLD",
+          "position_mode": "BH",
+          "grid": null,
+          "last_indicators": {
+            "as_of": "2026-11-20",
+            "prev_55d_high": 1.241,
+            "prev_20d_low": 1.05,
+            "atr20": 0.03795
+          }
+        },
+        "510720.SH": {
+          "raw_regime": "BUY_AND_HOLD",
+          "effective_regime": "BUY_AND_HOLD",
+          "position_mode": "BH",
+          "grid": null,
+          "last_indicators": {
+            "as_of": "2026-11-20",
+            "prev_55d_high": 1.100997152071,
+            "prev_20d_low": 0.988943141153,
+            "atr20": 0.016359940358
+          }
+        },
+        "512400.SH": {
+          "raw_regime": "BUY_AND_HOLD",
+          "effective_regime": "BUY_AND_HOLD",
+          "position_mode": "BH",
+          "grid": null,
+          "last_indicators": {
+            "as_of": "2026-11-20",
+            "prev_55d_high": 1.905296685955,
+            "prev_20d_low": 1.255,
+            "atr20": 0.0474
+          }
+        },
+        "512480.SH": {
+          "raw_regime": "BUY_AND_HOLD",
+          "effective_regime": "BUY_AND_HOLD",
+          "position_mode": "BH",
+          "grid": null,
+          "last_indicators": {
+            "as_of": "2026-11-20",
+            "prev_55d_high": 1.079,
+            "prev_20d_low": 0.694,
+            "atr20": 0.04375
+          }
+        },
+        "512880.SH": {
+          "raw_regime": "BUY_AND_HOLD",
+          "effective_regime": "BUY_AND_HOLD",
+          "position_mode": "BH",
+          "grid": null,
+          "last_indicators": {
+            "as_of": "2026-11-20",
+            "prev_55d_high": 1.117,
+            "prev_20d_low": 0.959,
+            "atr20": 0.01785
+          }
+        },
+        "515790.SH": {
+          "raw_regime": "BUY_AND_HOLD",
+          "effective_regime": "BUY_AND_HOLD",
+          "position_mode": "BH",
+          "grid": null,
+          "last_indicators": {
+            "as_of": "2026-11-20",
+            "prev_55d_high": 0.855,
+            "prev_20d_low": 0.648,
+            "atr20": 0.0242
+          }
+        }
+      },
+      "trades": [
+        {
+          "trade_id": 1,
+          "date": "2026-11-20",
+          "account": "C",
+          "symbol": "159622.SZ",
+          "action": "BH_INIT_BUY",
+          "side": "BUY",
+          "shares": 15700,
+          "price": 1.058,
+          "notional": 16610.6,
+          "commission": 3.32212,
+          "stamp_duty": 0.0,
+          "net_cash_flow": -16613.92212,
+          "regime": "BUY_AND_HOLD",
+          "trigger_price": 1.058,
+          "grid_level": null,
+          "note": "equal_weight=1/6"
+        },
+        {
+          "trade_id": 2,
+          "date": "2026-11-20",
+          "account": "C",
+          "symbol": "510720.SH",
+          "action": "BH_INIT_BUY",
+          "side": "BUY",
+          "shares": 16500,
+          "price": 1.009,
+          "notional": 16648.5,
+          "commission": 3.3297000000000003,
+          "stamp_duty": 0.0,
+          "net_cash_flow": -16651.8297,
+          "regime": "BUY_AND_HOLD",
+          "trigger_price": 1.009,
+          "grid_level": null,
+          "note": "equal_weight=1/6"
+        },
+        {
+          "trade_id": 3,
+          "date": "2026-11-20",
+          "account": "C",
+          "symbol": "512400.SH",
+          "action": "BH_INIT_BUY",
+          "side": "BUY",
+          "shares": 13400,
+          "price": 1.24,
+          "notional": 16616.0,
+          "commission": 3.3232000000000004,
+          "stamp_duty": 0.0,
+          "net_cash_flow": -16619.3232,
+          "regime": "BUY_AND_HOLD",
+          "trigger_price": 1.24,
+          "grid_level": null,
+          "note": "equal_weight=1/6"
+        },
+        {
+          "trade_id": 4,
+          "date": "2026-11-20",
+          "account": "C",
+          "symbol": "512480.SH",
+          "action": "BH_INIT_BUY",
+          "side": "BUY",
+          "shares": 21900,
+          "price": 0.76,
+          "notional": 16644.0,
+          "commission": 3.3288,
+          "stamp_duty": 0.0,
+          "net_cash_flow": -16647.3288,
+          "regime": "BUY_AND_HOLD",
+          "trigger_price": 0.76,
+          "grid_level": null,
+          "note": "equal_weight=1/6"
+        },
+        {
+          "trade_id": 5,
+          "date": "2026-11-20",
+          "account": "C",
+          "symbol": "512880.SH",
+          "action": "BH_INIT_BUY",
+          "side": "BUY",
+          "shares": 17000,
+          "price": 0.978,
+          "notional": 16626.0,
+          "commission": 3.3252,
+          "stamp_duty": 0.0,
+          "net_cash_flow": -16629.3252,
+          "regime": "BUY_AND_HOLD",
+          "trigger_price": 0.978,
+          "grid_level": null,
+          "note": "equal_weight=1/6"
+        },
+        {
+          "trade_id": 6,
+          "date": "2026-11-20",
+          "account": "C",
+          "symbol": "515790.SH",
+          "action": "BH_INIT_BUY",
+          "side": "BUY",
+          "shares": 25800,
+          "price": 0.644,
+          "notional": 16615.2,
+          "commission": 3.32304,
+          "stamp_duty": 0.0,
+          "net_cash_flow": -16618.52304,
+          "regime": "BUY_AND_HOLD",
+          "trigger_price": 0.644,
+          "grid_level": null,
+          "note": "equal_weight=1/6"
+        }
+      ],
+      "corporate_actions": [],
+      "daily_records": [
+        {
+          "date": "2026-11-20",
+          "cash": 219.74793999999383,
+          "market_value": 98899.8,
+          "equity": 99119.54793999999,
+          "nav": 0.9911954793999999,
+          "daily_return": -0.008804520600000143,
+          "cum_return": -0.008804520600000143,
+          "peak_equity": 100000.0,
+          "drawdown": -0.008804520600000143,
+          "max_drawdown": -0.008804520600000143,
+          "positions_count": 6,
+          "trades_today": 6
+        }
+      ]
+    },
+    "D": {
+      "account_id": "D",
+      "account_type": "benchmark_bh",
+      "initial_capital": 100000.0,
+      "cash": 116.6273199999996,
+      "equity": 100221.82732,
+      "nav": 1.0022182732,
+      "peak_equity": 100221.82732,
+      "max_drawdown": 0.0,
+      "initialized": true,
+      "positions": {
+        "159330.SZ": {
+          "shares": 80600,
+          "avg_cost": 1.2392478
+        }
+      },
+      "symbol_states": {
+        "159330.SZ": {
+          "raw_regime": "BENCHMARK",
+          "effective_regime": "BENCHMARK",
+          "position_mode": "BH",
+          "grid": null,
+          "last_indicators": {
+            "as_of": "2026-11-20",
+            "prev_55d_high": 1.455,
+            "prev_20d_low": 1.241,
+            "atr20": 0.0194
+          }
+        }
+      },
+      "trades": [
+        {
+          "trade_id": 1,
+          "date": "2026-11-20",
+          "account": "D",
+          "symbol": "159330.SZ",
+          "action": "BH_INIT_BUY",
+          "side": "BUY",
+          "shares": 80600,
+          "price": 1.239,
+          "notional": 99863.4,
+          "commission": 19.97268,
+          "stamp_duty": 0.0,
+          "net_cash_flow": -99883.37268,
+          "regime": "BENCHMARK",
+          "trigger_price": 1.239,
+          "grid_level": null,
+          "note": "benchmark_full_allocation"
+        }
+      ],
+      "corporate_actions": [],
+      "daily_records": [
+        {
+          "date": "2026-11-20",
+          "cash": 116.6273199999996,
+          "market_value": 100105.2,
+          "equity": 100221.82732,
+          "nav": 1.0022182732,
+          "daily_return": 0.0022182732000000094,
+          "cum_return": 0.0022182732000000094,
+          "peak_equity": 100221.82732,
+          "drawdown": 0.0,
+          "max_drawdown": 0.0,
+          "positions_count": 1,
+          "trades_today": 1
+        }
+      ]
+    }
+  },
+  "next_effective_regime": {
+    "159622.SZ": "TRANSITION",
+    "510720.SH": "TRANSITION",
+    "512400.SH": "TRANSITION",
+    "512480.SH": "TRANSITION",
+    "512880.SH": "TRANSITION",
+    "515790.SH": "TRAP_OFF"
+  },
+  "regime_audit_log": [
+    {
+      "recorded_at_market_date": "2026-11-20",
+      "recorded_at": "2026-11-24T10:54:04+08:00",
+      "event": "INIT",
+      "changes": {
+        "159622.SZ": {
+          "from": null,
+          "to": "TRANSITION"
+        },
+        "510720.SH": {
+          "from": null,
+          "to": "TRANSITION"
+        },
+        "512400.SH": {
+          "from": null,
+          "to": "TRANSITION"
+        },
+        "512480.SH": {
+          "from": null,
+          "to": "TRANSITION"
+        },
+        "512880.SH": {
+          "from": null,
+          "to": "TRANSITION"
+        },
+        "515790.SH": {
+          "from": null,
+          "to": "TRAP_OFF"
+        }
+      }
+    }
+  ],
+  "symbol_names": {
+    "159330.SZ": "沪深300ETF",
+    "159622.SZ": "沪港深创新药ETF",
+    "510720.SH": "红利国企ETF",
+    "512400.SH": "有色金属ETF",
+    "512480.SH": "半导体ETF",
+    "512880.SH": "证券ETF",
+    "515790.SH": "光伏ETF"
+  },
+  "updated_at": "2026-11-24 10:54:04"
+}
