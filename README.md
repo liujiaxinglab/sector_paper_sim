@@ -2,89 +2,30 @@
 
 ## 1. 项目定位
 
-`sector_paper_sim` 是独立、轻量的行业 ETF 确定性模拟盘仓库。本项目承接 `sector_radar` 的四态路由结论，面向「1 宽基基准（`159330.SZ`）+ 6 行业 ETF（`512400.SH`、`510720.SH`、`159622.SZ`、`515790.SH`、`512480.SH`、`512880.SH`）」构建可完全复现的日频模拟撮合引擎与周度净值账本，用于在 12–18 个月例行运行期内，客观检验信息路由相对沪深 300 基准与纯机械规则的真实增量。
+`sector_paper_sim` 是承接上游 `sector_radar` 四态定档与 `QRI` / `QuantData` 权威数据底座的**交易日日频步进确定性模拟撮合与五账户基准对照引擎**。本项目面向「`159330.SZ`（沪深300ETF 基准）+ 6 只行业 ETF（`159622.SZ`、`510720.SH`、`512400.SH`、`512480.SH`、`512880.SH`、`515790.SH`）」，以可完全重放的日频确定性状态机并行追踪五组虚拟账户（`Account A` 四态路由实验盘、`Account B1` 纯机械海龟、`Account B2` 纯机械日频网格、`Account C` 行业等权持有、`Account D` 沪深300持有），在 12–18 个月实证运行期内持续检验信息路由相对纯机械规则与宽基基准的真实增量。
 
-核心设计原则：
-- **单一事实配置**：全仓参数统一收口于标准 JSON 文件 [sim_config.json](project_content/config/sim_config.json)（禁止使用 YAML）。
-- **确定性可复现**：每日严格按「除息再投 -> 开盘路由切换/`TRAP_OFF`强平 -> 盘中海龟/网格触价撮合 -> 收盘净值核算」4 步顺序执行，无随机性、无未来函数。
-- **长期低维护**：完成阶段 1 引擎搭建后即退出开发 Task 流，进入 12–18 个月周五例行运行期，产出落盘于 `output/` 目录并纳入版本追踪。
+## 2. 多仓库协同边界
 
-## 2. 上游只读边界与物理隔离
-
-本仓库与外部上游仓库严格执行**单向只读边界**，所有文件创建与写入操作仅限于 `D:/VibeCoding/Quant/sector_paper_sim/` 目录内，严禁修改任何上游或兄弟仓库文件：
-
-| 仓库 / 数据目录 | 路径 | 访问权限 | 消费内容 |
+| 仓库 | 角色定位 | 与本仓访问边界 | 消费 / 产出摘要 |
 | --- | --- | --- | --- |
-| `QuantData`（TDX 日线） | `D:/VibeCoding/Quant/QuantData/raw/tdx/vipdoc_parsed` | **只读** | 7 只 ETF 本地 `TDX-01` 解析后的最新批次日线 CSV |
-| `QuantData`（分红台账） | `D:/VibeCoding/Quant/QuantData/reference/etf/corporate_actions/20261120/watchlist_dividend_events.json` | **只读** | 官方核验 ETF 现金分红除息与每份分红事件 |
-| `sector_radar` | `D:/VibeCoding/Quant/sector_radar/project_content/config/watchlist.json` | **只读** | 观察池标的元数据、四态路由 `current_regime` 与份额拆分 `split_events` |
-| `KnowledgeBase` | `D:/VibeCoding/KnowledgeBase` | **只读** | V2 项目管理协议与方法论参考，严禁写入 |
-| `youce_quant_510720_strategy` | 独立策略研究仓 | **隔离 / 禁写** | 独立仓位，无写入耦合 |
+| `KnowledgeBase` | 公共项目管理规范与经验库 | **只读引用**（严禁写入） | 提供 V2 项目管理协议（`00`–`03`）与共享数据复用规范 |
+| `QRI`（`quant_research_infrastructure`） | 本地量化数据采集底座 | **只读对齐**（严禁写入） | 提供 `TDX-01` 日线与 `BS-01` 交易日历数据采集能力规范 |
+| `QuantData` | 本地权威量化数据仓 | **只读消费**（严禁写入） | 提供 `TDX-01` ETF 日线、`BS-01` 交易日历及公司行为台账 |
+| `sector_radar` | 行情定性与四态路由器 | **只读消费**（严禁写入） | 提供观察池配置、`regime_history.json` 四态路由历史与实盘对照基准 |
+| `sector_paper_sim`（本仓） | 日频确定性模拟撮合引擎 | **独立维护与落盘** | 消费上述只读上游，产出结构化日频净值、成交明细与对账报告 |
 
-## 3. 目录结构
+## 3. 总体阶段路线
 
-```text
-sector_paper_sim/
-├── .gitignore
-├── README.md
-├── project_management/
-│   ├── 00_项目总规划.md                  # 阶段 1 与阶段 2 总体路线
-│   ├── 01_阶段1_引擎搭建_子规划.md        # 1t01–1t04 范围与验收标准
-│   ├── tasks/                            # 各 Task 客观执行结果回执
-│   └── reviews/                          # 独立审阅记录
-├── project_content/
-│   ├── config/
-│   │   └── sim_config.json               # 唯一标准 JSON 配置文件
-│   └── docs/
-│       └── 01_撮合与切换确定性规则.md     # 每日 4 步撮合顺序与参数口径
-├── src/                                  # 模拟盘核心源码（1t02–1t04 实现）
-├── output/                               # 周报与账户状态快照（Git 追踪，不被忽略）
-└── tests/                                # 单元测试与只读连通性自检
-    └── test_upstream_readonly.py
-```
+1. **[阶段 1｜初版引擎搭建（历史归档）](project_management/subplan/1%20初版引擎搭建（历史归档）/1%20子规划.md)**：完成初版建仓与周频原型试跑；`2026-11-26` 经 V2 审计发现 9 项协议、撮合规则与可复现性问题（`ISS-001`–`ISS-009`）后作废冻结归档。
+2. **[阶段 2｜日频化与合规重构](project_management/subplan/2%20日频化与合规重构/2%20子规划.md)（当前阶段）**：迁移至 KnowledgeBase V2 架构与标准包结构，修复全部撮合违约并切换至 `2026-11-23` 起算的日频可重放模拟引擎，通过全量/增量一致性与双仓对账验证。
+3. **阶段 3｜日频常态化跟随对账运行（待进入）**：阶段 2 收口并退出开发 Task 流后，随交易日日频例行步进并持续与 `sector_radar` 实盘对照账本对账检验。
 
-## 4. 运行环境与命令（Conda `quant`）
+## 4. 项目管理与业务入口
 
-本仓库强制显式使用 Conda `quant` 环境解释器，禁用系统默认 `python`，严禁执行 `pip install`：
-
-```powershell
-# 查看 Python 与 pytest 版本
-C:\Users\jxing\.conda\envs\quant\python.exe --version
-C:\Users\jxing\.conda\envs\quant\python.exe -m pytest --version
-
-# 运行上游只读连通性自检（pytest）
-C:\Users\jxing\.conda\envs\quant\python.exe -m pytest tests/test_upstream_readonly.py -v
-
-# 运行上游只读连通性诊断摘要
-C:\Users\jxing\.conda\envs\quant\python.exe tests/test_upstream_readonly.py
-
-# 运行全量单元测试
-C:\Users\jxing\.conda\envs\quant\python.exe -m pytest tests/ -v
-```
-
-### 每周五盘后增量运行（CLI 唯一入口）
-
-完成本地 TDX 日线同步后，每周五盘后执行一条命令即可自动补算新交易日、锁定下周路由并落盘 `output/state.json`、`output/trades.csv`、`output/nav_weekly.md`：
-
-```powershell
-# 例行周五盘后增量更新（已有 output/state.json 时自动推进新交易日并刷新下周锁定路由）
-C:\Users\jxing\.conda\envs\quant\python.exe -m src.run_weekly_sim
-
-# 仅预演并打印五账户汇总（不写盘）
-C:\Users\jxing\.conda\envs\quant\python.exe -m src.run_weekly_sim --dry-run
-
-# 首次基线建盘（仅在无 output/state.json 时生效；默认取共同最新交易日）
-C:\Users\jxing\.conda\envs\quant\python.exe -m src.run_weekly_sim --start-date 2026-11-20
-
-# 可选参数：自定义配置/输出目录/截止日，或在确认滞后警告后强制推进
-C:\Users\jxing\.conda\envs\quant\python.exe -m src.run_weekly_sim --config project_content/config/sim_config.json --output-dir output --end-date 2026-11-27 --allow-lag
-```
-
-> **防未来函数说明**：增量推进新交易日时，引擎严格使用上周落盘的 `state.json["next_effective_regime"]`；待本周交易日推进完成后，再读取最新 `watchlist.json` 刷新下周锁定路由。若周五盘后先跑完脚本、随后更新了 `sector_radar` 的 `watchlist.json`，可同日重跑 `python -m src.run_weekly_sim` 幂等刷新下周锁定路由与周报（不会重复推进交易日或追加重复历史行）。
-
-## 5. 文档导航
-
-- 项目总规划：[project_management/00_项目总规划.md](project_management/00_项目总规划.md)
-- 阶段 1 子规划：[project_management/01_阶段1_引擎搭建_子规划.md](project_management/01_阶段1_引擎搭建_子规划.md)
-- 唯一配置文件：[project_content/config/sim_config.json](project_content/config/sim_config.json)
-- 撮合与切换规则：[project_content/docs/01_撮合与切换确定性规则.md](project_content/docs/01_撮合与切换确定性规则.md)
+- 统一项目管理协议（`liujiaxinglab/KnowledgeBase`）：`project_content/10_常用规则/03_项目管理协议.md`
+- 当前状态：[project_management/status.md](project_management/status.md)
+- 路线决策记录：[project_management/路线决策记录.md](project_management/路线决策记录.md)
+- 问题追踪台账：[project_management/issues.md](project_management/issues.md)
+- 规则与技能索引：[rules_map.md](project_management/common/rules_map.md) ｜ [skills_map.md](project_management/common/skills_map.md) ｜ [本地量化Python执行环境约定.md](project_management/common/本地量化Python执行环境约定.md)
+- 撮合与切换确定性规则：[project_content/docs/01_撮合与切换确定性规则.md](project_content/docs/01_撮合与切换确定性规则.md)
+- 唯一模拟参数配置：[project_content/config/sim_config.json](project_content/config/sim_config.json)
