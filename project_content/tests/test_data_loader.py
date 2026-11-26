@@ -792,6 +792,59 @@ def test_tdx_latest_batch_deduplicates_and_validates_dates(tmp_path: Path) -> No
     assert list(frame.columns) == list(TDX_REQUIRED_COLUMNS)
 
 
+def test_connectivity_accepts_rolling_batches_and_advancing_ledger_watermark(
+    tmp_path: Path,
+) -> None:
+    newer_days = [*ISO_DAYS, "2026-11-27"]
+    config = _make_synthetic_config(
+        tmp_path,
+        {"159330.SZ": newer_days, "512400.SH": newer_days},
+    )
+    upstream = config["upstream_paths"]
+    tdx_dir = Path(upstream["tdx_daily_dir"])
+    for symbol in [config["universe"]["benchmark"], *config["universe"]["sectors"]]:
+        batch_dir = tdx_dir / symbol
+        latest = batch_dir / "20261127_101530.csv"
+        latest.write_text(
+            "date,open,high,low,close,amount,volume,reserved\n"
+            + "".join(
+                f"{day},1.00,1.02,0.98,1.01,1000.0,1000,0\n"
+                for day in newer_days
+            ),
+            encoding="utf-8",
+        )
+    calendar_dir = Path(upstream["trade_calendar_dir"])
+    (calendar_dir / "20261127_101530.csv").write_text(
+        "calendar_date,is_trading_day\n"
+        + "2026-11-23,1\n2026-11-24,1\n2026-11-25,1\n"
+        + "2026-11-26,1\n2026-11-27,1\n",
+        encoding="utf-8",
+    )
+    ledger_path = Path(upstream["corporate_actions_ledger_file"])
+    ledger_payload = json.loads(ledger_path.read_text(encoding="utf-8"))
+    ledger_payload["as_of"] = "2026-11-27"
+    ledger_payload["cash_dividends_by_symbol"]["512400.SH"] = [{
+        "ex_date": "2026-11-27", "cash_per_unit": 0.01,
+        "source_class": "OFFICIAL_TEST", "event_status": "VERIFIED",
+        "source_pdf": "raw/test/new_dividend.pdf", "source_pdf_sha256": "c" * 64,
+    }]
+    _write_json(ledger_path, ledger_payload)
+
+    bundle = load_market_bundle(config)
+    calendar = load_trade_calendar(
+        calendar_dir, start_date=config["start_date"], end_date="2026-11-27"
+    )
+    refreshed_ledger = load_corporate_actions_ledger(ledger_path)
+    assert bundle.metadata["latest_end_date"] == "2026-11-27"
+    assert all(
+        bundle.metadata["symbol_stats"][symbol]["latest_csv"] == "20261127_101530.csv"
+        for symbol in bundle.symbols
+    )
+    assert calendar == newer_days
+    assert refreshed_ledger.as_of == "2026-11-27"
+    assert refreshed_ledger.cash_dividends_by_symbol["512400.SH"][0]["ex_date"] == "2026-11-27"
+
+
 @pytest.mark.parametrize(
     "bad_row",
     [

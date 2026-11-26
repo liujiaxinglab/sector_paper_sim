@@ -28,4 +28,5 @@
 - 问题追踪台账：[project_management/issues.md](project_management/issues.md)
 - 规则与技能索引：[rules_map.md](project_management/common/rules_map.md) ｜ [skills_map.md](project_management/common/skills_map.md) ｜ [本地量化Python执行环境约定.md](project_management/common/本地量化Python执行环境约定.md)
 - 撮合与切换确定性规则：[project_content/docs/01_撮合与切换确定性规则.md](project_content/docs/01_撮合与切换确定性规则.md)
+- 实验复现与真实事件抽核：[project_content/docs/03_实验复现与真实事件抽核.md](project_content/docs/03_实验复现与真实事件抽核.md)
 - 唯一模拟参数配置：[project_content/config/sim_config.json](project_content/config/sim_config.json)

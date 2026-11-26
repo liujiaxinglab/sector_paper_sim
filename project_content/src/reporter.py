@@ -37,6 +37,10 @@ NAV_CSV_COLUMNS = (
 def _atomic_write_text(path: Path, content: str, *, immutable: bool = False) -> Path:
     path.parent.mkdir(parents=True, exist_ok=True)
     if immutable and path.exists():
+        if path.read_text(encoding="utf-8") != content:
+            raise ValueError(
+                f"Immutable output conflict at {path}; archive it or use a new experiment directory"
+            )
         return path
     temporary = None
     try:
@@ -53,7 +57,10 @@ def _atomic_write_text(path: Path, content: str, *, immutable: bool = False) -> 
             try:
                 os.link(temporary, path)
             except FileExistsError:
-                pass
+                if path.read_text(encoding="utf-8") != content:
+                    raise ValueError(
+                        f"Immutable output conflict at {path}; archive it or use a new experiment directory"
+                    )
         else:
             os.replace(temporary, path)
     finally:
@@ -68,6 +75,21 @@ def save_state_json(state: Mapping[str, Any], output_path: str | Path) -> Path:
 
 
 def load_state_json(input_path: str | Path) -> dict[str, Any]:
+    path = Path(input_path)
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(payload, dict):
+        raise ValueError(f"Expected a JSON object in {path}")
+    return payload
+
+
+def save_json_file(
+    payload: Mapping[str, Any], output_path: str | Path, *, immutable: bool = False,
+) -> Path:
+    content = json.dumps(payload, indent=2, ensure_ascii=False, allow_nan=False) + "\n"
+    return _atomic_write_text(Path(output_path), content, immutable=immutable)
+
+
+def load_json_file(input_path: str | Path) -> dict[str, Any]:
     path = Path(input_path)
     payload = json.loads(path.read_text(encoding="utf-8"))
     if not isinstance(payload, dict):
@@ -90,13 +112,23 @@ def _export_csv(
     path: Path, columns: tuple[str, ...], rows: Iterable[Mapping[str, Any]],
     previous_rows: Iterable[Mapping[str, Any]], key: Callable[[Mapping[str, Any]], tuple],
 ) -> Path:
+    return _atomic_write_text(
+        path, render_csv(columns, rows, previous_rows=previous_rows, key=key)
+    )
+
+
+def render_csv(
+    columns: tuple[str, ...], rows: Iterable[Mapping[str, Any]],
+    *, previous_rows: Iterable[Mapping[str, Any]] = (),
+    key: Callable[[Mapping[str, Any]], tuple],
+) -> str:
     merged = {key(row): row for row in previous_rows}
     merged.update((key(row), row) for row in rows)
     buffer = StringIO(newline="")
     writer = csv.DictWriter(buffer, fieldnames=columns, lineterminator="\n")
     writer.writeheader()
     writer.writerows(merged[k] for k in sorted(merged))
-    return _atomic_write_text(path, buffer.getvalue())
+    return buffer.getvalue()
 
 
 def export_trades_csv(

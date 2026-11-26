@@ -23,6 +23,7 @@ from src.data_loader import (
     load_sim_config,
 )
 from src.engine import ACCOUNT_IDS
+from src.experiment_manifest import canonical_json_bytes, manifest_sha256
 from src.reporter import (
     NAV_CSV_COLUMNS,
     TRADES_CSV_COLUMNS,
@@ -269,11 +270,25 @@ def test_daily_outputs_have_five_accounts_and_keep_only_the_checkpoint(tmp_path,
     assert cli_main(inputs.args(output, "--from-scratch", as_of=last_date)) == 0
     state = load_state_json(output / "state.json")
     assert set(state) == {
-        "schema_version", "start_date", "last_processed_date", "last_known_closes", "routing_checkpoint", "accounts",
+        "schema_version", "start_date", "last_processed_date", "last_known_closes",
+        "routing_checkpoint", "accounts", "experiment_id", "experiment_manifest_sha256",
+        "daily_input_manifest_chain_sha256",
     }
     assert state["start_date"] == START and state["last_processed_date"] == last_date
     assert set(state["accounts"]) == set(ACCOUNT_IDS)
     assert set(state["last_known_closes"]) == {BENCHMARK, *SECTORS}
+    manifest_path = output / "experiment_manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    assert manifest["schema_version"] == "1.0.0"
+    assert manifest["experiment_id"] == state["experiment_id"]
+    assert state["experiment_manifest_sha256"] == manifest_sha256(manifest)
+    assert manifest["simulation_start_date"] == START
+    assert manifest["initial_capital"] == 100000.0
+    assert manifest["config_sha256"] == hashlib.sha256(inputs.config.read_bytes()).hexdigest()
+    assert manifest["program_version"] and manifest["program_commit"]
+    assert manifest["program_source_sha256"] and manifest["rules_sha256"]
+    assert manifest["rules_version"]
+    assert manifest["account_strategy_config_summary"]["account_defaults"]["commission_rate"] == 0.0002
     raw = (output / "state.json").read_text(encoding="utf-8")
     for historical_key in ("trades", "daily_records", "excess_history", "corporate_actions", "updated_at", "next_effective_regime"):
         assert f'"{historical_key}"' not in raw
@@ -301,6 +316,25 @@ def test_daily_outputs_have_five_accounts_and_keep_only_the_checkpoint(tmp_path,
     snapshots = sorted((output / "history").glob("*.md"))
     assert snapshots == [snapshot_path(output, day) for day in inputs.dates]
     assert (output / "nav_latest.md").read_bytes() == snapshots[-1].read_bytes()
+    daily_inputs = sorted((output / "daily_inputs").glob("inputs_*.json"))
+    assert [path.name for path in daily_inputs] == [
+        f"inputs_{day.replace('-', '')}.json" for day in inputs.dates
+    ]
+    for path, day in zip(daily_inputs, inputs.dates):
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        assert payload["experiment_id"] == manifest["experiment_id"]
+        assert payload["run_date"] == payload["trade_date"] == day
+        assert payload["allow_lag"] is False
+        assert payload["forward_eval_start_date"] is None
+        assert len(payload["inputs"]["tdx_batches"]) == len(SECTORS) + 1
+        assert all(len(item["sha256"]) == 64 for item in payload["inputs"]["tdx_batches"])
+        assert payload["inputs"]["trade_calendar"]["file_name"].endswith(".csv")
+        assert payload["inputs"]["corporate_actions_ledger"]["schema_version"] == "2.0.0"
+        assert payload["inputs"]["regime_history"]["schema_version"] == "2.0.0"
+    initial_input_hash = hashlib.sha256(
+        canonical_json_bytes(json.loads(daily_inputs[0].read_text(encoding="utf-8"))["inputs"])
+    ).hexdigest()
+    assert manifest["initialization_input_version"]["sha256"] == initial_input_hash
     marker = f"[停牌按前收估值 {inputs.dates[2]}]"
     suspended_report = snapshots[2].read_text(encoding="utf-8")
     assert marker in suspended_report and "DIVIDEND_CASH" in suspended_report
@@ -374,6 +408,12 @@ def test_lag_aborts_unless_explicitly_allowed_by_calendar_date(tmp_path, capsys,
     assert not output.exists()
     assert cli_main(inputs.args(output, "--allow-lag", as_of=requested)) == 0
     assert load_state_json(output / "state.json")["last_processed_date"] == requested
+    input_manifest = json.loads(
+        (output / "daily_inputs" / f"inputs_{requested.replace('-', '')}.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert input_manifest["allow_lag"] is True
     marker = f"{GRID} [行情滞后按前收估值 {requested}]"
     assert marker in (output / "nav_latest.md").read_text(encoding="utf-8")
     assert marker in capsys.readouterr().out
@@ -432,7 +472,7 @@ def test_provisional_effective_event_blocks_formal_and_dry_run_without_output(tm
     assert not output.exists()
 
 
-def test_from_scratch_replaces_legacy_checkpoint_and_rebuilds_current_ledgers(tmp_path, capsys):
+def test_from_scratch_preserves_conflicting_legacy_checkpoint_and_ledgers(tmp_path, capsys):
     inputs = make_inputs(tmp_path)
     output = tmp_path / "output"
     output.mkdir()
@@ -445,26 +485,109 @@ def test_from_scratch_replaces_legacy_checkpoint_and_rebuilds_current_ledgers(tm
     assert "--from-scratch" in capsys.readouterr().err
     assert load_state_json(output / "state.json") == legacy_state
 
-    assert cli_main(inputs.args(output, "--from-scratch", as_of=inputs.dates[1])) == 0
-    assert load_state_json(output / "state.json")["last_processed_date"] == inputs.dates[1]
-    assert read_csv_rows(output / "trades.csv", TRADES_CSV_COLUMNS)
+    assert cli_main(inputs.args(output, "--from-scratch", as_of=inputs.dates[1])) == 2
+    assert "conflicts with" in capsys.readouterr().err
+    assert load_state_json(output / "state.json") == legacy_state
+    assert (output / "trades.csv").read_bytes() == b"legacy"
     assert weekly.read_bytes() == b"stage 1\n"
 
 
-def test_rebuild_keeps_already_published_daily_snapshots(tmp_path):
+def test_from_scratch_blocks_changed_initial_inputs_and_preserves_outputs(tmp_path, capsys):
     inputs = make_inputs(tmp_path)
     output = tmp_path / "output"
     assert cli_main(inputs.args(output, as_of=inputs.dates[4])) == 0
-    before = {day: snapshot_path(output, day).read_bytes() for day in inputs.dates[:5]}
+    before = output_bytes(output)
     watchlist = json.loads(inputs.watchlist.read_text(encoding="utf-8"))
     watchlist["universe"][1]["name"] = "更新后的名称"
     write_json(inputs.watchlist, watchlist)
 
-    assert cli_main(inputs.args(output, "--from-scratch", as_of=inputs.dates[1])) == 0
-    assert load_state_json(output / "state.json")["last_processed_date"] == inputs.dates[1]
-    assert {row["date"] for row in read_csv_rows(output / "nav_daily.csv", NAV_CSV_COLUMNS)} == set(inputs.dates[:2])
-    assert "更新后的名称" in (output / "nav_latest.md").read_text(encoding="utf-8")
-    assert {day: snapshot_path(output, day).read_bytes() for day in before} == before
+    assert cli_main(inputs.args(output, "--from-scratch", as_of=inputs.dates[1])) == 2
+    assert "immutable experiment manifest" in capsys.readouterr().err
+    assert output_bytes(output) == before
+
+
+def test_from_scratch_rejects_conflicting_history_snapshot_before_writing(tmp_path, capsys):
+    inputs = make_inputs(tmp_path)
+    output = tmp_path / "output"
+    assert cli_main(inputs.args(output, "--from-scratch", as_of=inputs.dates[2])) == 0
+    snapshot = snapshot_path(output, inputs.dates[1])
+    snapshot.write_text("conflicting historical snapshot\n", encoding="utf-8")
+    before = output_bytes(output)
+
+    assert cli_main(inputs.args(output, "--from-scratch", as_of=inputs.dates[2])) == 2
+    assert "History snapshot conflicts" in capsys.readouterr().err
+    assert output_bytes(output) == before
+
+
+def test_resume_blocks_changed_experiment_configuration_without_writing(tmp_path, capsys):
+    inputs = make_inputs(tmp_path)
+    output = tmp_path / "output"
+    assert cli_main(inputs.args(output, as_of=inputs.dates[1])) == 0
+    before = output_bytes(output)
+    config = json.loads(inputs.config.read_text(encoding="utf-8"))
+    config["account_defaults"]["commission_rate"] = 0.0003
+    write_json(inputs.config, config)
+
+    assert cli_main(inputs.args(output, as_of=inputs.dates[2])) == 2
+    assert "Experiment manifest mismatch" in capsys.readouterr().err
+    assert output_bytes(output) == before
+
+
+def test_resume_blocks_unapproved_program_commit_in_manifest(tmp_path, capsys):
+    inputs = make_inputs(tmp_path)
+    output = tmp_path / "output"
+    assert cli_main(inputs.args(output, as_of=inputs.dates[1])) == 0
+    manifest_path = output / "experiment_manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["program_commit"] = "unapproved-version"
+    write_json(manifest_path, manifest)
+    before = output_bytes(output)
+
+    assert cli_main(inputs.args(output, as_of=inputs.dates[2])) == 2
+    error = capsys.readouterr().err
+    assert "Experiment manifest mismatch" in error
+    assert "program_commit" in error
+    assert output_bytes(output) == before
+
+
+def test_resume_blocks_edited_committed_daily_input_manifest(tmp_path, capsys):
+    inputs = make_inputs(tmp_path)
+    output = tmp_path / "output"
+    assert cli_main(inputs.args(output, as_of=inputs.dates[1])) == 0
+    input_path = output / "daily_inputs" / f"inputs_{inputs.dates[1].replace('-', '')}.json"
+    payload = json.loads(input_path.read_text(encoding="utf-8"))
+    payload["inputs"]["tdx_batches"][0]["sha256"] = "0" * 64
+    write_json(input_path, payload)
+    before = output_bytes(output)
+
+    assert cli_main(inputs.args(output, as_of=inputs.dates[2])) == 2
+    assert "manifest chain does not match" in capsys.readouterr().err
+    assert output_bytes(output) == before
+
+
+def test_legacy_outputs_are_adopted_only_after_exact_full_replay(tmp_path, capsys):
+    inputs = make_inputs(tmp_path)
+    output = tmp_path / "output"
+    assert cli_main(inputs.args(output, "--from-scratch", as_of=inputs.dates[2])) == 0
+    original = output_bytes(output)
+
+    (output / "experiment_manifest.json").unlink()
+    shutil.rmtree(output / "daily_inputs")
+    legacy_state = load_state_json(output / "state.json")
+    legacy_state.pop("experiment_id")
+    legacy_state.pop("experiment_manifest_sha256")
+    legacy_state.pop("daily_input_manifest_chain_sha256")
+    save_state_json(legacy_state, output / "state.json")
+
+    assert cli_main(inputs.args(output, "--from-scratch", as_of=inputs.dates[2])) == 0
+    assert "本次推进" in capsys.readouterr().out
+    assert (output / "experiment_manifest.json").is_file()
+    assert len(list((output / "daily_inputs").glob("inputs_*.json"))) == 3
+    for relative in (
+        Path("nav_daily.csv"), Path("trades.csv"), Path("nav_latest.md"),
+        *(Path("history") / f"nav_{day.replace('-', '')}.md" for day in inputs.dates[:3]),
+    ):
+        assert (output / relative).read_bytes() == original[relative]
 
 
 def test_reporter_merge_replaces_duplicate_keys_and_sorts_numeric_trade_ids(tmp_path):
@@ -508,7 +631,8 @@ def test_atomic_writes_leave_prior_file_intact_and_clean_temporary_file(tmp_path
     assert load_state_json(path) == {"field": "旧"}
     assert list(tmp_path.iterdir()) == [path]
     save_daily_snapshot(tmp_path, START, "第一版\n")
-    save_daily_snapshot(tmp_path, START, "第二版\n")
+    with pytest.raises(ValueError, match="Immutable output conflict"):
+        save_daily_snapshot(tmp_path, START, "第二版\n")
     assert snapshot_path(tmp_path, START).read_text(encoding="utf-8") == "第一版\n"
 
 
@@ -607,6 +731,18 @@ def test_forward_excess_returns_exclude_backfill_initialization_period(tmp_path)
     assert fwd_res["routing_stats"]["backfill_records_excluded"] == 1
     assert fwd_res["routing_stats"]["live_records_applied"] == 2
     assert fwd_res["routing_stats"]["forward_live_records_applied"] == 2
+    initial_inputs = json.loads(
+        (output / "daily_inputs" / f"inputs_{inputs.dates[0].replace('-', '')}.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    forward_inputs = json.loads(
+        (output / "daily_inputs" / f"inputs_{inputs.dates[4].replace('-', '')}.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert initial_inputs["run_mode"] == "replay"
+    assert forward_inputs["run_mode"] == "formal"
 
     nav_rows_list = read_csv_rows(output / "nav_daily.csv", NAV_CSV_COLUMNS)
     base = {r["account"]: float(r["nav"]) for r in nav_rows_list if r["date"] == inputs.dates[3]}
