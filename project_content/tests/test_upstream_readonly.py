@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+import pytest
 
 from src.data_loader import (
     DEFAULT_SIM_CONFIG_PATH,
@@ -15,6 +16,8 @@ from src.data_loader import (
     load_trade_calendar,
     load_watchlist,
 )
+from src.engine import run_simulation
+from src.reporter import NAV_CSV_COLUMNS, read_csv_rows
 
 EXPECTED_SYMBOLS = [
     "159330.SZ",
@@ -120,3 +123,23 @@ def test_real_ledger_has_sorted_dividends_and_split_factor() -> None:
         event["effective_date"] == "2026-07-03" and event["factor"] == 0.5
         for event in splits
     )
+
+
+def test_real_backfill_regime_history_blocks_formal_and_replays_existing_nav() -> None:
+    config = load_sim_config(DEFAULT_SIM_CONFIG_PATH)
+    bundle = load_market_bundle(config)
+    all_records = bundle.regime_history.all_records()
+    assert bundle.regime_history.schema_version == "2.0.0"
+    assert len(all_records) == 6
+    assert all(rec["record_type"] == "BACKFILL" and rec["recorded_at"] is None for rec in all_records)
+
+    with pytest.raises(ValueError, match="BACKFILL"):
+        run_simulation(bundle, end_date="2026-11-25", run_mode="formal")
+
+    replayed = run_simulation(bundle, end_date="2026-11-25", run_mode="replay")
+    expected_nav_path = DEFAULT_SIM_CONFIG_PATH.parents[1] / "output" / "nav_daily.csv"
+    stored_rows = read_csv_rows(expected_nav_path, NAV_CSV_COLUMNS)
+    expected_by_key = {(row["date"], row["account"]): float(row["nav"]) for row in stored_rows}
+    for day in replayed.daily_results:
+        for account_id, metrics in day["accounts"].items():
+            assert metrics["nav"] == pytest.approx(expected_by_key[day["date"], account_id])

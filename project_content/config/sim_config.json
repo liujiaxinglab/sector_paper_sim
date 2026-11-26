@@ -1,6 +1,11 @@
 {
   "project_name": "sector_paper_sim",
   "start_date": "2026-11-23",
+  "backfill_replay_window": {
+    "start_date": "2026-11-23",
+    "end_date": "2026-11-26"
+  },
+  "forward_eval_start_date": null,
   "upstream_paths": {
     "tdx_daily_dir": "D:/VibeCoding/Quant/QuantData/raw/tdx/vipdoc_parsed",
     "trade_calendar_dir": "D:/VibeCoding/Quant/QuantData/raw/baostock/query_trade_dates",

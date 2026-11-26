@@ -100,6 +100,49 @@ def _committed_ledgers(
     return list(nav.values()), list(trades.values()), needs_refresh
 
 
+def _compute_forward_excess_returns(
+    all_nav_rows: Sequence[Mapping[str, Any]],
+    *,
+    start_date: str,
+    last_processed_date: str | None,
+    forward_eval_start_date: str | None,
+    regime_history: Any,
+) -> dict[str, float]:
+    """Compute forward-only A vs B1/B2/C/D excess returns excluding BACKFILL-contaminated periods."""
+    if not forward_eval_start_date or not last_processed_date or last_processed_date < forward_eval_start_date:
+        return {}
+    if any(
+        rec.get("record_type") == "BACKFILL" and rec["effective_date"] >= forward_eval_start_date
+        for rec in regime_history.all_records()
+        if rec["effective_date"] <= last_processed_date
+    ):
+        return {}
+
+    nav_by_date: dict[str, dict[str, float]] = {}
+    for row in all_nav_rows:
+        nav_by_date.setdefault(str(row["date"]), {})[str(row["account"])] = float(row["nav"])
+    if last_processed_date not in nav_by_date:
+        return {}
+
+    if forward_eval_start_date == start_date:
+        baseline_nav = {account: 1.0 for account in ACCOUNT_IDS}
+    else:
+        prior_dates = [day for day in sorted(nav_by_date) if day < forward_eval_start_date]
+        if not prior_dates:
+            return {}
+        baseline_nav = nav_by_date[prior_dates[-1]]
+
+    latest_nav = nav_by_date[last_processed_date]
+    forward_returns = {
+        account: latest_nav[account] / baseline_nav[account] - 1.0
+        for account in ACCOUNT_IDS
+    }
+    return {
+        f"A_vs_{account}": forward_returns["A"] - forward_returns[account]
+        for account in ACCOUNT_IDS[1:]
+    }
+
+
 def run_daily_sim(
     *,
     config_path: str | Path = DEFAULT_SIM_CONFIG_PATH,
@@ -108,6 +151,8 @@ def run_daily_sim(
     from_scratch: bool = False,
     allow_lag: bool = False,
     dry_run: bool = False,
+    run_mode: str = "formal",
+    forward_eval_start_date: str | None = None,
 ) -> dict[str, Any]:
     """Load, replay and publish one daily run, or return the dry-run calculation."""
     bundle = load_market_bundle(config_path)
@@ -157,12 +202,26 @@ def run_daily_sim(
         if previous_state["last_processed_date"] > dates[-1]:
             raise ValueError("--as-of precedes the checkpoint. Rebuild with --from-scratch to rewind.")
 
-    engine = SimulationEngine(bundle, previous_state, trading_dates=dates)
+    engine = SimulationEngine(
+        bundle,
+        previous_state,
+        trading_dates=dates,
+        run_mode=run_mode,
+        forward_eval_start_date=forward_eval_start_date,
+    )
     if previous_state is not None:
         previous_nav, previous_trades, refresh_ledgers = _committed_ledgers(output_dir, previous_state, dates)
     summary = engine.run()
     state = engine.export_state()
     days = engine.daily_results
+    all_nav = [*previous_nav, *(row for day in days for row in nav_rows(day))]
+    forward_excess = _compute_forward_excess_returns(
+        all_nav,
+        start_date=start,
+        last_processed_date=engine.last_processed_date,
+        forward_eval_start_date=engine.forward_eval_start_date,
+        regime_history=bundle.regime_history,
+    )
 
     if not dry_run:
         report_path = output_dir / "nav_latest.md"
@@ -189,14 +248,19 @@ def run_daily_sim(
 
     prefix = "[DRY-RUN] " if dry_run else ""
     print(
-        f"{prefix}起算日 {start} | 净值日 {engine.last_processed_date} | "
+        f"{prefix}模式 {run_mode} | 起算日 {start} | 净值日 {engine.last_processed_date} | "
         f"本次推进 {len(days)} 个交易日 | 累计 {engine.trading_days_processed} 个交易日"
     )
     print(" | ".join(f"{account} NAV {ledger.nav:.6f}" for account, ledger in engine.accounts.items()))
     for day in days:
         for marker in valuation_markers(day):
             print(marker)
-    return {**summary, "state": state, "lag_warnings": lag_warnings}
+    return {
+        **summary,
+        "state": state,
+        "lag_warnings": lag_warnings,
+        "forward_excess_returns": forward_excess,
+    }
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
@@ -207,6 +271,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--from-scratch", action="store_true", help="从配置起算日重放")
     parser.add_argument("--allow-lag", action="store_true", help="允许行情滞后时按 BS-01 日历推进")
     parser.add_argument("--dry-run", action="store_true", help="计算净值并仅输出终端摘要")
+    parser.add_argument(
+        "--mode",
+        choices=("formal", "replay"),
+        default="formal",
+        help="运行模式：formal（正式前瞻，仅接受时序合格 LIVE 决策）或 replay（显式历史重放/状态初始化，允许 BACKFILL）",
+    )
     return parser
 
 
@@ -216,6 +286,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         outcome = run_daily_sim(
             config_path=args.config, output_dir=args.output_dir, as_of=args.as_of,
             from_scratch=args.from_scratch, allow_lag=args.allow_lag, dry_run=args.dry_run,
+            run_mode=args.mode,
         )
     except (OSError, ValueError, TypeError, KeyError, RuntimeError, csv.Error) as exc:
         print(f"[运行失败] {exc}", file=sys.stderr)

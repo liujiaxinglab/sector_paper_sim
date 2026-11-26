@@ -186,6 +186,39 @@ def build_daily_report(
                 lines.append(f"- {label} {event['div_cash']:,.6f} 元")
             else:
                 lines.append(f"- {label} {event['old_shares']:,} 股 → {event['new_shares']:,} 股")
+
+    run_mode = day.get("run_mode", "formal")
+    fwd_start = day.get("forward_eval_start_date")
+    backfill_window = day.get("backfill_replay_window")
+    routing_stats = day.get("routing_stats") or {}
+    window_desc = (
+        f"{backfill_window['start_date']}..{backfill_window['end_date']}"
+        if isinstance(backfill_window, Mapping)
+        else "未配置"
+    )
+    fwd_desc = fwd_start if fwd_start else "待用户确认（不混入 BACKFILL 信息增量）"
+    lines.extend([
+        "",
+        "## 路由来源与前瞻边界",
+        "",
+        f"- 运行模式：{run_mode}",
+        f"- 模拟资金起算日：{start_date} ｜ 历史初始化回放区间：{window_desc} ｜ 正式前瞻评价起点：{fwd_desc}",
+        (
+            f"- 截至当日路由记录统计：已生效 LIVE {routing_stats.get('live_records_applied', 0)} 条"
+            f"（前瞻期内 LIVE {routing_stats.get('forward_live_records_applied', 0)} 条），"
+            f"已隔离 BACKFILL {routing_stats.get('backfill_records_excluded', 0)} 条"
+            "（BACKFILL 仅用于状态初始化或历史重放，不计入信息路由增量统计）"
+        ),
+    ])
+    effective_records = day.get("effective_route_records") or []
+    if effective_records:
+        for rec in effective_records:
+            rec_ts = rec.get("recorded_at") or "null（历史补录时间边界见台账）"
+            lines.append(
+                f"- 当日生效路由：{rec['symbol']} {rec.get('prev_regime', '—')} -> {rec['regime']} "
+                f"[{rec['record_type']}]（decision_date={rec.get('decision_date') or '—'}, "
+                f"effective_date={rec['effective_date']}, recorded_at={rec_ts}）"
+            )
     return "\n".join(lines) + "\n"
 
 

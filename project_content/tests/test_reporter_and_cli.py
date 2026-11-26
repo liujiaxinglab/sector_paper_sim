@@ -129,7 +129,7 @@ def make_inputs(tmp_path: Path, *, lag_symbol=None, all_lag=False) -> Inputs:
     })
     regimes = tmp_path / "regime_history.json"
     write_json(regimes, {
-        "schema_version": "1.0.0",
+        "schema_version": "2.0.0",
         "anchor_start_date": START,
         "initial_regimes": {
             **dict.fromkeys(SECTORS, "TRANSITION"),
@@ -138,9 +138,36 @@ def make_inputs(tmp_path: Path, *, lag_symbol=None, all_lag=False) -> Inputs:
             UNRATED: "UNRATED",
         },
         "records": [
-            {"symbol": GRID, "effective_date": dates[2], "new_regime": "TRANSITION"},
-            {"symbol": TREND, "effective_date": dates[5], "new_regime": "RANGE_GRID"},
-            {"symbol": UNRATED, "effective_date": dates[7], "new_regime": "TREND_UP"},
+            {
+                "record_id": "RH-TEST-001",
+                "decision_date": dates[1],
+                "effective_date": dates[2],
+                "symbol": GRID,
+                "prev_regime": "RANGE_GRID",
+                "new_regime": "TRANSITION",
+                "record_type": "LIVE",
+                "recorded_at": f"{dates[1]}T16:00:00+08:00",
+            },
+            {
+                "record_id": "RH-TEST-002",
+                "decision_date": dates[4],
+                "effective_date": dates[5],
+                "symbol": TREND,
+                "prev_regime": "TREND_UP",
+                "new_regime": "RANGE_GRID",
+                "record_type": "LIVE",
+                "recorded_at": f"{dates[4]}T16:00:00+08:00",
+            },
+            {
+                "record_id": "RH-TEST-003",
+                "decision_date": dates[6],
+                "effective_date": dates[7],
+                "symbol": UNRATED,
+                "prev_regime": "TRANSITION",
+                "new_regime": "TREND_UP",
+                "record_type": "LIVE",
+                "recorded_at": f"{dates[6]}T16:00:00+08:00",
+            },
         ],
     })
     config = tmp_path / "sim_config.json"
@@ -446,3 +473,222 @@ def test_absolute_script_entry_point_works_from_outside_repo(tmp_path):
     assert proc.returncode == 0, proc.stderr
     assert "[DRY-RUN]" in proc.stdout and START in proc.stdout
     assert not output.exists()
+
+
+def test_cli_formal_rejects_backfill_and_replay_reproduces_deterministically(tmp_path, capsys):
+    inputs = make_inputs(tmp_path)
+    payload = json.loads(inputs.regimes.read_text(encoding="utf-8"))
+    payload["records"][0]["record_type"] = "BACKFILL"
+    payload["records"][0]["recorded_at"] = None
+    payload["records"][0]["time_evidence_boundary"] = "synthetic backfill window"
+    write_json(inputs.regimes, payload)
+
+    formal_out = tmp_path / "formal_out"
+    assert cli_main(inputs.args(formal_out, "--from-scratch", as_of=inputs.dates[-1])) == 2
+    assert "BACKFILL" in capsys.readouterr().err
+    assert not formal_out.exists()
+
+    replay_full = tmp_path / "replay_full"
+    replay_inc = tmp_path / "replay_inc"
+    assert cli_main(inputs.args(replay_full, "--mode", "replay", "--from-scratch", as_of=inputs.dates[-1])) == 0
+    for day in inputs.dates:
+        assert cli_main(inputs.args(replay_inc, "--mode", "replay", as_of=day)) == 0
+    assert output_bytes(replay_inc) == output_bytes(replay_full)
+    report = (replay_full / "nav_latest.md").read_text(encoding="utf-8")
+    assert "运行模式：replay" in report
+    assert "已生效 LIVE 2 条" in report
+    assert "已隔离 BACKFILL 1 条" in report
+
+
+def test_forward_excess_returns_exclude_backfill_initialization_period(tmp_path):
+    from src.run_daily_sim import run_daily_sim
+
+    inputs = make_inputs(tmp_path)
+    payload = json.loads(inputs.regimes.read_text(encoding="utf-8"))
+    payload["records"][0]["record_type"] = "BACKFILL"
+    payload["records"][0]["recorded_at"] = None
+    payload["records"][0]["time_evidence_boundary"] = "init backfill before forward eval"
+    write_json(inputs.regimes, payload)
+
+    cfg = json.loads(inputs.config.read_text(encoding="utf-8"))
+    cfg["backfill_replay_window"] = {"start_date": START, "end_date": inputs.dates[3]}
+    cfg["forward_eval_start_date"] = inputs.dates[4]
+    write_json(inputs.config, cfg)
+
+    output = tmp_path / "output"
+    init_res = run_daily_sim(
+        config_path=inputs.config, output_dir=output, as_of=inputs.dates[3], run_mode="replay"
+    )
+    assert init_res["forward_excess_returns"] == {}
+    assert init_res["routing_stats"]["backfill_records_excluded"] == 1
+    assert init_res["routing_stats"]["live_records_applied"] == 0
+
+    fwd_res = run_daily_sim(
+        config_path=inputs.config, output_dir=output, as_of=inputs.dates[-1], run_mode="formal"
+    )
+    assert fwd_res["routing_stats"]["backfill_records_excluded"] == 1
+    assert fwd_res["routing_stats"]["live_records_applied"] == 2
+    assert fwd_res["routing_stats"]["forward_live_records_applied"] == 2
+
+    nav_rows_list = read_csv_rows(output / "nav_daily.csv", NAV_CSV_COLUMNS)
+    base = {r["account"]: float(r["nav"]) for r in nav_rows_list if r["date"] == inputs.dates[3]}
+    last = {r["account"]: float(r["nav"]) for r in nav_rows_list if r["date"] == inputs.dates[-1]}
+    expected_a_vs_b2 = (last["A"] / base["A"] - 1.0) - (last["B2"] / base["B2"] - 1.0)
+    assert fwd_res["forward_excess_returns"]["A_vs_B2"] == pytest.approx(expected_a_vs_b2)
+
+
+def test_cross_repo_t_decision_t1_effective_synthesis_consistent_across_radar_and_sim(tmp_path):
+    """合成跨仓闭环测试：T(周五)收盘决定 TRANSITION->RANGE_GRID，T 日看板与模拟盘均维持 TRANSITION，T+1(周一)才显示并执行 RANGE_GRID。"""
+    import importlib.util
+
+    radar_script = (
+        DEFAULT_SIM_CONFIG_PATH.parents[3]
+        / "sector_radar"
+        / "project_content"
+        / "scripts"
+        / "run_daily_board.py"
+    )
+    if not radar_script.is_file():
+        pytest.skip("Sibling sector_radar repository not present")
+    spec = importlib.util.spec_from_file_location("sector_radar_board_probe", radar_script)
+    assert spec is not None and spec.loader is not None
+    board = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(board)
+
+    # 2026-11-27 = Friday (T), 2026-11-30 = Monday (T+1)
+    inputs = make_inputs(tmp_path)
+    friday = "2026-11-27"
+    monday = "2026-11-30"
+    assert friday in inputs.dates and monday in inputs.dates
+
+    qd_root = tmp_path / "qd"
+    for sym_dir in (tmp_path / "bars").iterdir():
+        dst = qd_root / "raw" / "tdx" / "vipdoc_parsed" / sym_dir.name
+        dst.mkdir(parents=True, exist_ok=True)
+        for csv_file in sym_dir.glob("*.csv"):
+            (dst / csv_file.name).write_text(csv_file.read_text(encoding="utf-8"), encoding="utf-8")
+    cal_dst = qd_root / "raw" / "baostock" / "query_trade_dates"
+    cal_dst.mkdir(parents=True, exist_ok=True)
+    (cal_dst / inputs.calendar.name).write_text(inputs.calendar.read_text(encoding="utf-8"), encoding="utf-8")
+
+    # Add dummy CSI / CN10Y and corporate actions ledger for Radar
+    csi_dir = qd_root / "raw" / "csi" / "index_perf" / "20261208_100000"
+    csi_dir.mkdir(parents=True, exist_ok=True)
+    for idx_code in ("000300", "000151"):
+        write_json(csi_dir / f"{idx_code}.json", {"code": "200", "msg": "Success", "data": []})
+    bond_dir = qd_root / "raw" / "akshare" / "bond_china_yield" / "20261208"
+    bond_dir.mkdir(parents=True, exist_ok=True)
+    write_csv(bond_dir / "20261208_100000.csv", ("曲线名称", "日期", "1年", "10年"), [("中债国债收益率曲线", monday, "1.3", "1.6")])
+
+    all_symbols = [BENCHMARK, *SECTORS]
+    radar_repo = tmp_path / "radar_repo"
+    cards_dir = radar_repo / "project_content" / "radar_cards"
+    cards_dir.mkdir(parents=True, exist_ok=True)
+    for sym in SECTORS:
+        (cards_dir / f"{sym}_测试.md").write_text(f"# {sym}\n\n- **更新日期**：`{friday}`\n", encoding="utf-8")
+
+    radar_ledger = qd_root / "reference" / "etf" / "corporate_actions" / "latest" / "corporate_actions_ledger.json"
+    radar_ledger.parent.mkdir(parents=True, exist_ok=True)
+    write_json(radar_ledger, {
+        "schema_version": "2.0.0",
+        "as_of": inputs.dates[-1],
+        "generated_at": "2026-12-08T10:00:00+08:00",
+        "authority_rule": "TEST",
+        "raw_sources": {"sse_announcements_dir": "raw/sse", "cninfo_announcements_dir": "raw/cninfo", "eastmoney_discovery_years": ["2026"]},
+        "symbols": {s: {"name": s, "exchange": "SSE" if s.endswith(".SH") else "SZSE", "official_source": "test"} for s in all_symbols},
+        "cash_dividends_by_symbol": {s: [] for s in all_symbols},
+        "splits_by_symbol": {s: [] for s in all_symbols},
+    })
+
+    shared_regime = radar_repo / "project_content" / "journal" / "regime_history.json"
+    shared_regime.parent.mkdir(parents=True, exist_ok=True)
+    write_json(shared_regime, {
+        "schema_version": "2.0.0",
+        "anchor_start_date": START,
+        "initial_regimes": dict.fromkeys(SECTORS, "TRANSITION"),
+        "records": [
+            {
+                "record_id": "RH-20261127-001",
+                "decision_date": friday,
+                "effective_date": monday,
+                "symbol": GRID,
+                "prev_regime": "TRANSITION",
+                "new_regime": "RANGE_GRID",
+                "record_type": "LIVE",
+                "recorded_at": "2026-11-27T16:00:00+08:00",
+                "trigger_alerts": ["[新触发] 20日跌破"],
+                "card_path": f"project_content/radar_cards/{GRID}_测试.md",
+                "decision_ref": f"2026_decisions.md#{friday}-{GRID}",
+            }
+        ],
+    })
+
+    shared_watchlist = radar_repo / "project_content" / "config" / "watchlist.json"
+    shared_watchlist.parent.mkdir(parents=True, exist_ok=True)
+    write_json(shared_watchlist, {
+        "benchmark": BENCHMARK,
+        "paths": {
+            "qri_root": str(tmp_path / "qri"),
+            "vipdoc_root": str(tmp_path / "vipdoc"),
+            "quantdata_root": str(qd_root),
+            "corporate_actions_ledger": str(radar_ledger),
+            "tdx_parsed_dir": str(qd_root / "raw" / "tdx" / "vipdoc_parsed"),
+            "trade_dates_dir": str(cal_dst),
+            "csi_index_perf_dir": str(qd_root / "raw" / "csi" / "index_perf"),
+            "danjuan_eva_dir": str(qd_root / "raw" / "danjuan" / "index_eva_detail"),
+            "bond_yield_dir": str(qd_root / "raw" / "akshare" / "bond_china_yield"),
+            "board_output": "project_content/output/board_latest.md",
+            "board_history_dir": "project_content/output/history",
+            "regime_history": "project_content/journal/regime_history.json",
+            "radar_cards_dir": "project_content/radar_cards",
+        },
+        "alert_rules": {
+            "price_pct_lookback": 750, "breakout_lookback": 55, "breakdown_lookback": 20,
+            "excess_20d_abs_pct": 5.0, "atr_window": 20, "vol_ratio_window": 20,
+            "vol_surge_ratio_20d": 1.8, "valuation_lookback_years": 5,
+            "valuation_low_pct": 20.0, "valuation_high_pct": 80.0,
+            "valuation_stale_days": 45, "overdue_review_trade_days": 20,
+        },
+        "universe": [
+            {
+                "symbol": s,
+                "name": f"ETF {s}",
+                "role": "benchmark" if s == BENCHMARK else "sector",
+                "valuation_metric": "PE",
+                "valuation_index_name": s,
+                "valuation_index_code": "000300" if s == BENCHMARK else "000151",
+                "danjuan_index_code": None,
+                "current_regime": "BENCHMARK" if s == BENCHMARK else "TRANSITION",
+                "manual_valuation": {"pe_pct": None, "pb_pct": None, "ps_pct": None, "as_of": None, "force": False, "note": ""},
+            }
+            for s in all_symbols
+        ],
+    })
+
+    sim_cfg = json.loads(inputs.config.read_text(encoding="utf-8"))
+    sim_cfg["upstream_paths"]["corporate_actions_ledger_file"] = str(radar_ledger)
+    sim_cfg["upstream_paths"]["regime_history_file"] = str(shared_regime)
+    sim_cfg["upstream_paths"]["watchlist_file"] = str(shared_watchlist)
+    write_json(inputs.config, sim_cfg)
+    sim_out = tmp_path / "sim_out"
+
+    # On Friday (T): Radar board, watchlist, and Paper Sim all keep TRANSITION
+    radar_friday = board.run_daily_board(config_path=shared_watchlist, as_of=friday, dry_run=True, repo_root=radar_repo)
+    assert next(r for r in radar_friday["results"] if r["symbol"] == GRID)["current_regime"] == "TRANSITION"
+    assert cli_main(inputs.args(sim_out, as_of=friday)) == 0
+    sim_state_friday = load_state_json(sim_out / "state.json")["accounts"]["A"]
+    assert sim_state_friday["symbol_states"][GRID]["active_regime"] == "TRANSITION"
+    assert sim_state_friday["positions"][GRID]["shares"] == 0
+    assert [t for t in read_csv_rows(sim_out / "trades.csv", TRADES_CSV_COLUMNS) if t["account"] == "A"] == []
+
+    # On Monday (T+1): Radar syncs watchlist, board shows RANGE_GRID, Paper Sim opens RANGE_GRID
+    trade_dates, _ = board.load_trade_calendar(cal_dst)
+    board.sync_watchlist_regimes(shared_watchlist, shared_regime, trade_dates, radar_repo, as_of_date=date.fromisoformat(monday))
+    radar_monday = board.run_daily_board(config_path=shared_watchlist, as_of=monday, dry_run=True, repo_root=radar_repo)
+    assert next(r for r in radar_monday["results"] if r["symbol"] == GRID)["current_regime"] == "RANGE_GRID"
+    assert cli_main(inputs.args(sim_out, as_of=monday)) == 0
+    sim_state_monday = load_state_json(sim_out / "state.json")["accounts"]["A"]
+    assert sim_state_monday["symbol_states"][GRID]["active_regime"] == "RANGE_GRID"
+    assert sim_state_monday["positions"][GRID]["shares"] > 0
+    a_trades = [t for t in read_csv_rows(sim_out / "trades.csv", TRADES_CSV_COLUMNS) if t["account"] == "A"]
+    assert [(t["date"], t["symbol"], t["action"]) for t in a_trades] == [(monday, GRID, "GRID_INIT_BUY")]

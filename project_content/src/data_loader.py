@@ -7,9 +7,9 @@ upstream files or falling back to network sources.
 
 from __future__ import annotations
 
-from bisect import bisect_left
+from bisect import bisect_left, bisect_right
 from dataclasses import dataclass
-from datetime import date
+from datetime import date, datetime, time, timedelta, timezone
 import json
 import math
 from pathlib import Path
@@ -25,9 +25,15 @@ DEFAULT_SIM_CONFIG_PATH = REPO_ROOT / "project_content" / "config" / "sim_config
 TDX_BATCH_CSV_PATTERN = re.compile(r"^\d{8}_\d{6}\.csv$")
 TRADE_CALENDAR_CSV_PATTERN = re.compile(r"^\d{8}_\d{6}\.csv$")
 ISO_DATE_PATTERN = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+ISO_DATETIME_TZ_PATTERN = re.compile(
+    r"^\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})$"
+)
 SHA256_PATTERN = re.compile(r"^[0-9a-f]{64}$")
 CORPORATE_ACTIONS_SCHEMA_VERSION = "2.0.0"
-REGIME_HISTORY_SCHEMA_VERSION = "1.0.0"
+REGIME_HISTORY_SCHEMA_VERSION = "2.0.0"
+REGIME_RECORD_TYPES: frozenset[str] = frozenset({"LIVE", "BACKFILL"})
+CHINA_TZ = timezone(timedelta(hours=8))
+MARKET_OPEN_TIME = time(9, 30, 0)
 ROUTABLE_REGIMES: frozenset[str] = frozenset(
     {"TREND_UP", "RANGE_GRID", "TRANSITION", "TRAP_OFF", "UNRATED"}
 )
@@ -63,14 +69,56 @@ ALLOWED_REGIMES: frozenset[str] = frozenset(
 )
 
 
+def _parse_tz_aware_iso_datetime(raw_value: Any, label: str) -> datetime:
+    if not isinstance(raw_value, str) or not raw_value.strip():
+        raise ValueError(f"{label} must be a timezone-aware ISO 8601 timestamp, got {raw_value!r}")
+    text = raw_value.strip()
+    if not ISO_DATETIME_TZ_PATTERN.fullmatch(text):
+        raise ValueError(
+            f"{label} must be a full timezone-aware ISO 8601 timestamp, got {raw_value!r}"
+        )
+    try:
+        parsed = datetime.fromisoformat(text)
+    except ValueError as exc:
+        raise ValueError(f"{label} is not a valid ISO 8601 timestamp: {raw_value!r}") from exc
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        raise ValueError(f"{label} must include timezone offset: {raw_value!r}")
+    return parsed.astimezone(CHINA_TZ)
+
+
+def _validate_live_recorded_at(
+    raw_recorded_at: Any,
+    decision_date: str,
+    effective_date: str,
+    label: str,
+) -> str:
+    recorded_cst = _parse_tz_aware_iso_datetime(raw_recorded_at, f"{label}.recorded_at")
+    dec_dt = date.fromisoformat(decision_date)
+    eff_dt = date.fromisoformat(effective_date)
+    dec_start = datetime(dec_dt.year, dec_dt.month, dec_dt.day, 0, 0, 0, tzinfo=CHINA_TZ)
+    eff_open = datetime(
+        eff_dt.year, eff_dt.month, eff_dt.day, MARKET_OPEN_TIME.hour, MARKET_OPEN_TIME.minute, 0, tzinfo=CHINA_TZ
+    )
+    if recorded_cst < dec_start:
+        raise ValueError(
+            f"{label}.recorded_at ({recorded_cst.isoformat()}) precedes decision_date ({decision_date})"
+        )
+    if recorded_cst >= eff_open:
+        raise ValueError(
+            f"{label}.recorded_at ({recorded_cst.isoformat()}) must precede effective_date market open "
+            f"({eff_open.isoformat()})"
+        )
+    return recorded_cst.isoformat()
+
+
 @dataclass(frozen=True)
 class RegimeHistory:
-    """Validated regime history with effective-date lookup semantics."""
+    """Validated regime history with effective-date lookup and LIVE/BACKFILL provenance."""
 
     schema_version: str
     anchor_start_date: str
     initial_regimes: dict[str, str]
-    records_by_symbol: dict[str, list[dict[str, str]]]
+    records_by_symbol: dict[str, list[dict[str, Any]]]
 
     def regime_for(self, symbol: str, trade_date: str) -> str:
         """Return the latest regime effective on ``trade_date`` for ``symbol``."""
@@ -89,6 +137,113 @@ class RegimeHistory:
                 break
             result = record["regime"]
         return result
+
+    def all_records(self) -> list[dict[str, Any]]:
+        """Return all regime records sorted deterministically by (effective_date, symbol)."""
+        flattened = [
+            {"symbol": symbol, **record}
+            for symbol, records in self.records_by_symbol.items()
+            for record in records
+        ]
+        flattened.sort(
+            key=lambda rec: (
+                rec["effective_date"],
+                rec.get("decision_date") or "",
+                rec.get("record_id") or "",
+                rec["symbol"],
+            )
+        )
+        return flattened
+
+    def records_effective_on(self, trade_date: str) -> list[dict[str, Any]]:
+        """Return records taking effect at market open on ``trade_date``."""
+        resolved_date = _normalize_iso_date(trade_date, "trade_date")
+        return [
+            record
+            for record in self.all_records()
+            if record["effective_date"] == resolved_date
+        ]
+
+    def validate_for_run_mode(
+        self,
+        run_mode: str,
+        processed_dates: Sequence[str],
+        *,
+        forward_eval_start_date: str | None = None,
+    ) -> None:
+        """Enforce formal forward-run vs explicit replay boundary on LIVE/BACKFILL records."""
+        if run_mode not in {"formal", "replay"}:
+            raise ValueError(f"Unsupported run_mode {run_mode!r}; expected 'formal' or 'replay'")
+        stepped_set = {
+            _normalize_iso_date(day, "processed_date") for day in processed_dates
+        }
+        eval_start = (
+            _normalize_iso_date(forward_eval_start_date, "forward_eval_start_date")
+            if forward_eval_start_date is not None
+            else None
+        )
+        for symbol, records in sorted(self.records_by_symbol.items()):
+            for idx, record in enumerate(records):
+                label = f"regime_history[{symbol}][{idx}]"
+                record_type = record.get("record_type")
+                if record_type not in REGIME_RECORD_TYPES:
+                    raise ValueError(
+                        f"{label} has invalid record_type {record_type!r}; "
+                        f"expected one of {sorted(REGIME_RECORD_TYPES)}"
+                    )
+                effective_date = record["effective_date"]
+                decision_date = record.get("decision_date")
+                if record_type == "LIVE":
+                    if not decision_date:
+                        raise ValueError(f"{label} LIVE record lacks decision_date")
+                    _validate_live_recorded_at(
+                        record.get("recorded_at"),
+                        decision_date,
+                        effective_date,
+                        label,
+                    )
+                elif run_mode == "formal":
+                    if effective_date in stepped_set or (
+                        eval_start is not None and effective_date >= eval_start
+                    ):
+                        raise ValueError(
+                            f"正式前瞻运行拒绝消费 BACKFILL 路由记录: {symbol} "
+                            f"{record.get('record_id') or '(no-id)'} effective_date={effective_date}; "
+                            "历史回放或状态初始化请显式使用 --mode replay"
+                        )
+
+    def routing_stats_through(
+        self,
+        trade_date: str,
+        *,
+        forward_eval_start_date: str | None = None,
+    ) -> dict[str, Any]:
+        """Summarize LIVE vs BACKFILL counts through ``trade_date``, excluding BACKFILL from LIVE stats."""
+        resolved_date = _normalize_iso_date(trade_date, "trade_date")
+        eval_start = (
+            _normalize_iso_date(forward_eval_start_date, "forward_eval_start_date")
+            if forward_eval_start_date is not None
+            else None
+        )
+        through_records = [
+            rec for rec in self.all_records() if rec["effective_date"] <= resolved_date
+        ]
+        live_records = [rec for rec in through_records if rec.get("record_type") == "LIVE"]
+        backfill_records = [rec for rec in through_records if rec.get("record_type") == "BACKFILL"]
+        forward_live_records = (
+            [rec for rec in live_records if rec["effective_date"] >= eval_start]
+            if eval_start is not None
+            else []
+        )
+        return {
+            "through_date": resolved_date,
+            "forward_eval_start_date": eval_start,
+            "live_records_applied": len(live_records),
+            "forward_live_records_applied": len(forward_live_records),
+            "backfill_records_excluded": len(backfill_records),
+            "live_record_ids": [rec.get("record_id") or "" for rec in live_records],
+            "backfill_record_ids": [rec.get("record_id") or "" for rec in backfill_records],
+        }
 
 
 @dataclass(frozen=True)
@@ -196,7 +351,26 @@ def _validate_sim_config(config: Mapping[str, Any], source_label: str) -> dict[s
 
     if "start_date" not in config:
         raise ValueError(f"Missing required config key 'start_date' in {source_label}")
-    _normalize_iso_date(config["start_date"], "start_date")
+    start_date = _normalize_iso_date(config["start_date"], "start_date")
+
+    if config.get("forward_eval_start_date") is not None:
+        fwd_start = _normalize_iso_date(
+            config["forward_eval_start_date"], "forward_eval_start_date"
+        )
+        if fwd_start < start_date:
+            raise ValueError(
+                f"forward_eval_start_date {fwd_start} precedes start_date {start_date}"
+            )
+    if config.get("backfill_replay_window") is not None:
+        window = config["backfill_replay_window"]
+        if not isinstance(window, Mapping):
+            raise ValueError(f"'backfill_replay_window' must be a JSON object in {source_label}")
+        win_start = _normalize_iso_date(window.get("start_date"), "backfill_replay_window.start_date")
+        win_end = _normalize_iso_date(window.get("end_date"), "backfill_replay_window.end_date")
+        if win_start > win_end:
+            raise ValueError(
+                f"backfill_replay_window start_date {win_start} exceeds end_date {win_end}"
+            )
 
     universe = config["universe"]
     if not isinstance(universe, Mapping):
@@ -559,8 +733,12 @@ def assess_corporate_actions_gate(
     }
 
 
-def load_regime_history(regime_history_file: str | Path) -> RegimeHistory:
-    """Load route history and expose deterministic effective-date lookup."""
+def load_regime_history(
+    regime_history_file: str | Path,
+    *,
+    trading_calendar: Sequence[str] | None = None,
+) -> RegimeHistory:
+    """Load route history, enforce Schema/T+1/LIVE-BACKFILL rules, and expose effective-date lookup."""
     path = Path(regime_history_file)
     payload = _read_json_object(path, "regime_history_file")
     schema_version = payload.get("schema_version")
@@ -572,6 +750,13 @@ def load_regime_history(regime_history_file: str | Path) -> RegimeHistory:
     anchor = _normalize_iso_date(
         payload.get("anchor_start_date"), "regime_history.anchor_start_date"
     )
+    calendar_list = list(trading_calendar) if trading_calendar is not None else None
+    calendar_set = set(calendar_list) if calendar_list is not None else None
+    if calendar_set is not None and anchor not in calendar_set:
+        raise ValueError(
+            f"regime_history.anchor_start_date {anchor} is not a BS-01 trading day"
+        )
+
     raw_initial = payload.get("initial_regimes")
     if not isinstance(raw_initial, Mapping) or not raw_initial:
         raise ValueError(f"Missing or invalid 'initial_regimes' object in {path}")
@@ -590,45 +775,133 @@ def load_regime_history(regime_history_file: str | Path) -> RegimeHistory:
     raw_records = payload.get("records")
     if not isinstance(raw_records, list):
         raise ValueError(f"Missing or invalid 'records' list in {path}")
-    records_by_symbol: dict[str, list[dict[str, str]]] = {
+    records_by_symbol: dict[str, list[dict[str, Any]]] = {
         symbol: [] for symbol in initial
     }
     seen: set[tuple[str, str]] = set()
+    seen_ids: set[str] = set()
     for idx, raw_record in enumerate(raw_records):
+        label = f"regime_history.records[{idx}]"
         if not isinstance(raw_record, Mapping):
-            raise ValueError(f"regime_history.records[{idx}] must be an object in {path}")
+            raise ValueError(f"{label} must be an object in {path}")
         raw_symbol = raw_record.get("symbol")
         if not isinstance(raw_symbol, str) or not raw_symbol.strip():
-            raise ValueError(f"regime_history.records[{idx}].symbol is invalid in {path}")
+            raise ValueError(f"{label}.symbol is invalid in {path}")
         symbol = raw_symbol.strip()
         if symbol not in initial:
             raise ValueError(
-                f"regime_history.records[{idx}] symbol {symbol!r} has no initial regime"
+                f"{label} symbol {symbol!r} has no initial regime"
             )
+
+        record_id = raw_record.get("record_id")
+        if record_id is not None:
+            if not isinstance(record_id, str) or not record_id.strip():
+                raise ValueError(f"{label}.record_id must be a non-empty string")
+            record_id = record_id.strip()
+            if record_id in seen_ids:
+                raise ValueError(f"Duplicate regime record_id {record_id!r} in {path}")
+            seen_ids.add(record_id)
+
+        decision_date = _normalize_iso_date(
+            raw_record.get("decision_date"),
+            f"{label}.decision_date",
+        )
         effective_date = _normalize_iso_date(
             raw_record.get("effective_date"),
-            f"regime_history.records[{idx}].effective_date",
+            f"{label}.effective_date",
         )
-        if effective_date < anchor:
+        if decision_date < anchor:
             raise ValueError(
-                f"regime_history.records[{idx}] effective_date {effective_date} "
-                f"precedes anchor {anchor}"
+                f"{label} decision_date {decision_date} precedes anchor {anchor}"
             )
+        if effective_date <= decision_date:
+            raise ValueError(
+                f"{label} effective_date {effective_date} must strictly follow decision_date {decision_date}"
+            )
+        if calendar_list is not None and calendar_set is not None:
+            if decision_date not in calendar_set:
+                raise ValueError(
+                    f"{label} decision_date {decision_date} is not a BS-01 trading day"
+                )
+            next_idx = bisect_right(calendar_list, decision_date)
+            if next_idx >= len(calendar_list):
+                raise ValueError(
+                    f"BS-01 calendar lacks T+1 trading day after {decision_date} for {label}"
+                )
+            expected_effective = calendar_list[next_idx]
+            if effective_date != expected_effective:
+                raise ValueError(
+                    f"{label} effective_date {effective_date} must strictly equal BS-01 T+1 "
+                    f"{expected_effective} (not calendar +1 day)"
+                )
+
         if (symbol, effective_date) in seen:
             raise ValueError(
                 f"Duplicate regime effective_date {effective_date} for {symbol} in {path}"
             )
         seen.add((symbol, effective_date))
+
+        prev_regime = _normalized_regime(
+            raw_record.get("prev_regime"),
+            f"{label}.prev_regime",
+        )
         new_regime = _normalized_regime(
             raw_record.get("new_regime"),
-            f"regime_history.records[{idx}].new_regime",
-        )
-        records_by_symbol[symbol].append(
-            {"effective_date": effective_date, "regime": new_regime}
+            f"{label}.new_regime",
         )
 
-    for records in records_by_symbol.values():
-        records.sort(key=lambda record: record["effective_date"])
+        record_type = raw_record.get("record_type")
+        if not isinstance(record_type, str) or record_type not in REGIME_RECORD_TYPES:
+            raise ValueError(
+                f"{label}.record_type must be one of {sorted(REGIME_RECORD_TYPES)}, got {record_type!r}"
+            )
+        if "recorded_at" not in raw_record:
+            raise ValueError(f"{label} missing required field 'recorded_at'")
+        raw_recorded_at = raw_record.get("recorded_at")
+        raw_boundary = raw_record.get("time_evidence_boundary")
+        if record_type == "LIVE":
+            normalized_recorded_at: str | None = _validate_live_recorded_at(
+                raw_recorded_at, decision_date, effective_date, label
+            )
+            if raw_boundary is not None and (not isinstance(raw_boundary, str) or not raw_boundary.strip()):
+                raise ValueError(f"{label}.time_evidence_boundary must be non-empty if provided")
+        else:
+            if raw_recorded_at is None:
+                if not isinstance(raw_boundary, str) or not raw_boundary.strip():
+                    raise ValueError(
+                        f"{label} BACKFILL record with recorded_at=null requires non-empty time_evidence_boundary"
+                    )
+                normalized_recorded_at = None
+            else:
+                normalized_recorded_at = _parse_tz_aware_iso_datetime(
+                    raw_recorded_at, f"{label}.recorded_at"
+                ).isoformat()
+                if raw_boundary is not None and (not isinstance(raw_boundary, str) or not raw_boundary.strip()):
+                    raise ValueError(f"{label}.time_evidence_boundary must be non-empty if provided")
+
+        records_by_symbol[symbol].append(
+            {
+                "record_id": record_id or "",
+                "decision_date": decision_date,
+                "effective_date": effective_date,
+                "prev_regime": prev_regime,
+                "regime": new_regime,
+                "record_type": record_type,
+                "recorded_at": normalized_recorded_at,
+                "time_evidence_boundary": raw_boundary.strip() if isinstance(raw_boundary, str) else None,
+            }
+        )
+
+    for symbol, records in records_by_symbol.items():
+        records.sort(key=lambda record: (record["effective_date"], record["decision_date"], record["record_id"]))
+        expected_prev = initial[symbol]
+        for rec in records:
+            if rec["prev_regime"] != expected_prev:
+                raise ValueError(
+                    f"regime_history {symbol} effective_date={rec['effective_date']} "
+                    f"prev_regime {rec['prev_regime']!r} breaks chain from {expected_prev!r}"
+                )
+            expected_prev = rec["regime"]
     return RegimeHistory(
         schema_version=schema_version,
         anchor_start_date=anchor,
@@ -888,14 +1161,6 @@ def load_market_bundle(config: Mapping[str, Any] | str | Path) -> MarketBundle:
         watchlist[symbol] = dict(watchlist[symbol])
         watchlist[symbol]["split_events"] = [dict(event) for event in splits[symbol]]
 
-    regime_history = load_regime_history(regime_history_file)
-    missing_regimes = [sym for sym in sectors if sym not in regime_history.initial_regimes]
-    if missing_regimes:
-        raise ValueError(
-            f"Regime history is missing initial routes for configured sectors: "
-            f"{missing_regimes} ({regime_history_file})"
-        )
-
     bars: dict[str, pd.DataFrame] = {
         sym: load_tdx_daily(tdx_daily_dir, sym) for sym in symbols
     }
@@ -913,6 +1178,15 @@ def load_market_bundle(config: Mapping[str, Any] | str | Path) -> MarketBundle:
     all_calendar_dates, calendar_file, all_calendar_rows = _read_trade_calendar(
         calendar_dir, start_date=common_start_date, end_date=latest_end_date
     )
+    regime_history = load_regime_history(
+        regime_history_file, trading_calendar=all_calendar_dates
+    )
+    missing_regimes = [sym for sym in sectors if sym not in regime_history.initial_regimes]
+    if missing_regimes:
+        raise ValueError(
+            f"Regime history is missing initial routes for configured sectors: "
+            f"{missing_regimes} ({regime_history_file})"
+        )
     trading_calendar = [
         dt for dt in all_calendar_dates if common_start_date <= dt <= latest_end_date
     ]
@@ -1020,6 +1294,8 @@ def load_market_bundle(config: Mapping[str, Any] | str | Path) -> MarketBundle:
         "corporate_actions_as_of": ledger.as_of,
         "unverified_corporate_action_events": [dict(event) for event in ledger.unverified_events],
         "regime_history_anchor_start_date": regime_history.anchor_start_date,
+        "backfill_replay_window": resolved_config.get("backfill_replay_window"),
+        "forward_eval_start_date": resolved_config.get("forward_eval_start_date"),
         "source_files": source_files,
         "symbol_stats": symbol_stats,
     }

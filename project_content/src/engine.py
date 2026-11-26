@@ -34,6 +34,7 @@ ACCOUNT_IDS = ("A", "B1", "B2", "C", "D")
 FIXED_REGIMES = {"B1": "TREND_UP", "B2": "RANGE_GRID", "C": "BUY_AND_HOLD", "D": "BENCHMARK"}
 CASH_REGIMES = {"TRANSITION", "TRAP_OFF"}
 SECTOR_COUNT = 6
+VALID_RUN_MODES = ("formal", "replay")
 
 
 @dataclass
@@ -124,11 +125,27 @@ class SimulationEngine:
     def __init__(
         self, bundle: MarketBundle, initial_state: Mapping[str, Any] | None = None,
         *, trading_dates: Sequence[str] | None = None,
+        run_mode: str = "formal", forward_eval_start_date: str | None = None,
     ) -> None:
+        if run_mode not in VALID_RUN_MODES:
+            raise ValueError(f"Unsupported run_mode {run_mode!r}; expected one of {VALID_RUN_MODES}")
         self.bundle = bundle
+        self.run_mode = run_mode
         self.sectors = sorted(bundle.sectors)
         self.symbols = sorted(bundle.symbols)
         self.start_date = date.fromisoformat(bundle.config["start_date"]).isoformat()
+        resolved_fwd_start = (
+            forward_eval_start_date
+            if forward_eval_start_date is not None
+            else bundle.config.get("forward_eval_start_date")
+        )
+        if resolved_fwd_start is not None:
+            resolved_fwd_start = date.fromisoformat(str(resolved_fwd_start)).isoformat()
+            if resolved_fwd_start < self.start_date:
+                raise ValueError(
+                    f"forward_eval_start_date {resolved_fwd_start} precedes start_date {self.start_date}"
+                )
+        self.forward_eval_start_date: str | None = resolved_fwd_start
         if bundle.regime_history.anchor_start_date > self.start_date:
             raise ValueError(f"Regime history does not cover start_date {self.start_date}")
 
@@ -206,8 +223,12 @@ class SimulationEngine:
     def from_state(
         cls, bundle: MarketBundle, state_dict: Mapping[str, Any],
         *, trading_dates: Sequence[str] | None = None,
+        run_mode: str = "formal", forward_eval_start_date: str | None = None,
     ) -> SimulationEngine:
-        return cls(bundle, state_dict, trading_dates=trading_dates)
+        return cls(
+            bundle, state_dict, trading_dates=trading_dates,
+            run_mode=run_mode, forward_eval_start_date=forward_eval_start_date,
+        )
 
     def _load_state(self, state: Mapping[str, Any]) -> None:
         if state.get("schema_version") != ENGINE_SCHEMA_VERSION:
@@ -550,6 +571,9 @@ class SimulationEngine:
         if not gate["allowed"]:
             details = "; ".join(gate["reasons"])
             raise ValueError(f"Corporate-actions formal-run gate blocked {trade_date}: {details}")
+        self.bundle.regime_history.validate_for_run_mode(
+            self.run_mode, [trade_date], forward_eval_start_date=self.forward_eval_start_date
+        )
 
         targets = {}
         for symbol in self.sectors:
@@ -589,6 +613,10 @@ class SimulationEngine:
         self.trading_days_processed += 1
         missing = [symbol for symbol, bar in bars.items() if bar is None]
         lagged = [symbol for symbol in missing if trade_date > self._bar_dates[symbol][-1]]
+        effective_route_records = self.bundle.regime_history.records_effective_on(trade_date)
+        routing_stats = self.bundle.regime_history.routing_stats_through(
+            trade_date, forward_eval_start_date=self.forward_eval_start_date
+        )
         result = {
             "date": trade_date, "accounts": accounts, "excess_returns": excess,
             "suspended": [symbol for symbol in missing if symbol not in lagged], "lagged": lagged,
@@ -596,6 +624,11 @@ class SimulationEngine:
             "closes": dict(self.last_known_closes),
             "trades": [trade for day in days for trade in day.trades],
             "events": [event for day in days for event in day.events],
+            "run_mode": self.run_mode,
+            "forward_eval_start_date": self.forward_eval_start_date,
+            "backfill_replay_window": self.bundle.config.get("backfill_replay_window"),
+            "effective_route_records": effective_route_records,
+            "routing_stats": routing_stats,
         }
         self.daily_results.append(result)
         return result
@@ -603,6 +636,9 @@ class SimulationEngine:
     def run(self, end_date: str | None = None) -> dict[str, Any]:
         end = end_date or self._trading_dates[-1]
         dates = [day for day in self._trading_dates[self.trading_days_processed:] if day <= end]
+        self.bundle.regime_history.validate_for_run_mode(
+            self.run_mode, dates, forward_eval_start_date=self.forward_eval_start_date
+        )
         if dates:
             gate = assess_corporate_actions_gate(
                 self.bundle.metadata["corporate_actions_as_of"],
@@ -616,13 +652,29 @@ class SimulationEngine:
                 )
         for trade_date in dates:
             self.step_day(trade_date)
-        return {"processed_dates": dates, "last_processed_date": self.last_processed_date}
+        routing_stats = (
+            self.bundle.regime_history.routing_stats_through(
+                self.last_processed_date, forward_eval_start_date=self.forward_eval_start_date
+            )
+            if self.last_processed_date is not None
+            else None
+        )
+        return {
+            "processed_dates": dates,
+            "last_processed_date": self.last_processed_date,
+            "run_mode": self.run_mode,
+            "forward_eval_start_date": self.forward_eval_start_date,
+            "routing_stats": routing_stats,
+        }
 
 
 def run_simulation(
     bundle: MarketBundle, end_date: str | None = None,
     initial_state: Mapping[str, Any] | None = None,
+    *, run_mode: str = "formal", forward_eval_start_date: str | None = None,
 ) -> SimulationEngine:
-    engine = SimulationEngine(bundle, initial_state)
+    engine = SimulationEngine(
+        bundle, initial_state, run_mode=run_mode, forward_eval_start_date=forward_eval_start_date
+    )
     engine.run(end_date=end_date)
     return engine

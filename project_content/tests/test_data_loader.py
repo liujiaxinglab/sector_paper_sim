@@ -107,7 +107,7 @@ def _make_synthetic_config(tmp_path: Path, bar_dates: dict[str, list[str]]) -> d
     _write_json(
         regime_file,
         {
-            "schema_version": "1.0.0",
+            "schema_version": "2.0.0",
             "anchor_start_date": "2026-11-23",
             "initial_regimes": {symbol: "UNRATED" for symbol in sectors},
             "records": [],
@@ -356,30 +356,102 @@ def test_regime_history_uses_effective_date_and_maps_unrated(tmp_path: Path) -> 
     _write_json(
         history_path,
         {
-            "schema_version": "1.0.0",
+            "schema_version": "2.0.0",
             "anchor_start_date": "2026-11-23",
             "initial_regimes": {"512400.SH": "UNRATED"},
             "records": [
                 {
+                    "record_id": "RH-20261125-001",
+                    "decision_date": "2026-11-25",
                     "effective_date": "2026-11-26",
                     "symbol": "512400.SH",
+                    "prev_regime": "TREND_UP",
                     "new_regime": "RANGE_GRID",
+                    "record_type": "LIVE",
+                    "recorded_at": "2026-11-25T16:00:00+08:00",
                 },
                 {
+                    "record_id": "RH-20261123-001",
+                    "decision_date": "2026-11-23",
                     "effective_date": "2026-11-24",
                     "symbol": "512400.SH",
+                    "prev_regime": "TRANSITION",
                     "new_regime": "TREND_UP",
+                    "record_type": "LIVE",
+                    "recorded_at": "2026-11-23T16:00:00+08:00",
                 },
             ],
         },
     )
-    history = load_regime_history(history_path)
+    history = load_regime_history(history_path, trading_calendar=ISO_DAYS)
     assert history.regime_for("512400.SH", "2026-11-23") == "TRANSITION"
     assert history.regime_for("512400.SH", "2026-11-24") == "TREND_UP"
     assert history.regime_for("512400.SH", "2026-11-25") == "TREND_UP"
     assert history.regime_for("512400.SH", "2026-11-26") == "RANGE_GRID"
     with pytest.raises(ValueError, match="precedes"):
         history.regime_for("512400.SH", "2026-11-22")
+
+
+def test_regime_history_enforces_bs01_t1_and_live_backfill_timestamps(tmp_path: Path) -> None:
+    calendar = ["2026-11-26", "2026-11-27", "2026-11-30", "2026-12-01"]
+    base = {
+        "schema_version": "2.0.0",
+        "anchor_start_date": "2026-11-26",
+        "initial_regimes": {"512400.SH": "TRANSITION"},
+        "records": [
+            {
+                "record_id": "RH-20261127-001",
+                "decision_date": "2026-11-27",
+                "effective_date": "2026-11-30",
+                "symbol": "512400.SH",
+                "prev_regime": "TRANSITION",
+                "new_regime": "RANGE_GRID",
+                "record_type": "LIVE",
+                "recorded_at": "2026-11-30T01:29:59Z",
+            }
+        ],
+    }
+    history_path = tmp_path / "regime_history.json"
+    _write_json(history_path, base)
+    loaded = load_regime_history(history_path, trading_calendar=calendar)
+    assert loaded.regime_for("512400.SH", "2026-11-27") == "TRANSITION"
+    assert loaded.regime_for("512400.SH", "2026-11-30") == "RANGE_GRID"
+
+    # Calendar +1 day (Saturday 2026-11-28) instead of BS-01 Monday 2026-11-30 must fail
+    bad_weekend = json.loads(json.dumps(base))
+    bad_weekend["records"][0]["effective_date"] = "2026-11-28"
+    _write_json(history_path, bad_weekend)
+    with pytest.raises(ValueError, match="BS-01 T\\+1"):
+        load_regime_history(history_path, trading_calendar=calendar)
+
+    for bad_mut, pattern in [
+        (lambda d: d.__setitem__("schema_version", "1.0.0"), "schema_version"),
+        (lambda d: d["records"][0].__setitem__("record_type", "OTHER"), "record_type"),
+        (lambda d: d["records"][0].__setitem__("recorded_at", None), "recorded_at"),
+        (lambda d: d["records"][0].__setitem__("recorded_at", "2026-11-27T16:00:00"), "ISO 8601"),
+        (lambda d: d["records"][0].__setitem__("recorded_at", "2026-11-26T23:59:59+08:00"), "precedes decision_date"),
+        (lambda d: d["records"][0].__setitem__("recorded_at", "2026-11-30T09:30:00+08:00"), "market open"),
+        (lambda d: d["records"][0].__setitem__("recorded_at", "2026-11-30T01:30:00Z"), "market open"),
+    ]:
+        bad = json.loads(json.dumps(base))
+        bad_mut(bad)
+        _write_json(history_path, bad)
+        with pytest.raises(ValueError, match=pattern):
+            load_regime_history(history_path, trading_calendar=calendar)
+
+    # BACKFILL requires time_evidence_boundary when recorded_at is null
+    backfill = json.loads(json.dumps(base))
+    backfill["records"][0]["record_type"] = "BACKFILL"
+    backfill["records"][0]["recorded_at"] = None
+    _write_json(history_path, backfill)
+    with pytest.raises(ValueError, match="time_evidence_boundary"):
+        load_regime_history(history_path, trading_calendar=calendar)
+    backfill["records"][0]["time_evidence_boundary"] = "backfill committed at 2026-11-30T10:30:00+08:00"
+    _write_json(history_path, backfill)
+    bf_loaded = load_regime_history(history_path, trading_calendar=calendar)
+    with pytest.raises(ValueError, match="BACKFILL"):
+        bf_loaded.validate_for_run_mode("formal", ["2026-11-27", "2026-11-30"])
+    bf_loaded.validate_for_run_mode("replay", ["2026-11-27", "2026-11-30"])
 
 
 def test_tdx_latest_batch_deduplicates_and_validates_dates(tmp_path: Path) -> None:

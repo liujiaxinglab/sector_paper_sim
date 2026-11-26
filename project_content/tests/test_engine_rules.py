@@ -43,15 +43,19 @@ def make_bundle(
     splits: dict[str, list[dict[str, Any]]] | None = None,
     initial_routes: dict[str, str] | None = None,
     route_changes: dict[str, list[tuple[str, str]]] | None = None,
+    record_overrides: dict[str, list[dict[str, Any]]] | None = None,
+    forward_eval_start_date: str | None = None,
 ) -> MarketBundle:
     config = load_sim_config()
+    config["forward_eval_start_date"] = forward_eval_start_date
     symbols = [BENCHMARK, *sectors]
     config["universe"] = {"benchmark": BENCHMARK, "sectors": list(sectors)}
+    all_days = WARMUP + days
     raw = {}
     for symbol in symbols:
         overrides = (bars or {}).get(symbol, {})
         rows = []
-        for day in WARMUP + days:
+        for day in all_days:
             ohlc = overrides.get(day, (1.0, 1.005, 0.995, 1.0))
             if ohlc is not None:
                 rows.append((day, *ohlc, 10000, 10000))
@@ -59,13 +63,30 @@ def make_bundle(
     split_map = {symbol: (splits or {}).get(symbol, []) for symbol in symbols}
     dividend_map = {symbol: (dividends or {}).get(symbol, {}) for symbol in symbols}
     routes = {symbol: (initial_routes or {}).get(symbol, "TRANSITION") for symbol in sectors}
-    history = RegimeHistory(
-        "1.0.0", START, routes,
-        {
-            symbol: [{"effective_date": day, "regime": regime} for day, regime in changes]
-            for symbol, changes in (route_changes or {}).items()
-        },
-    )
+    if record_overrides is not None:
+        records_by_symbol = record_overrides
+    else:
+        records_by_symbol = {}
+        for symbol, changes in (route_changes or {}).items():
+            prev_reg = routes[symbol]
+            sym_records = []
+            for idx, (day, regime) in enumerate(changes, 1):
+                day_idx = all_days.index(day)
+                dec_day = all_days[day_idx - 1]
+                sym_records.append(
+                    {
+                        "record_id": f"RH-{symbol}-{idx}",
+                        "decision_date": dec_day,
+                        "effective_date": day,
+                        "prev_regime": prev_reg,
+                        "regime": regime,
+                        "record_type": "LIVE",
+                        "recorded_at": f"{dec_day}T16:00:00+08:00",
+                    }
+                )
+                prev_reg = regime
+            records_by_symbol[symbol] = sym_records
+    history = RegimeHistory("2.0.0", START, routes, records_by_symbol)
     return MarketBundle(
         config=config, benchmark=BENCHMARK, sectors=list(sectors), symbols=symbols, bars=raw,
         adjusted_bars={
@@ -547,3 +568,100 @@ def test_invalid_ohlc_range_cannot_be_used_as_a_tradable_bar():
     bundle = make_bundle([START], bars={SECTOR: {START: (1.0, 1.01, 0.99, 1.02)}})
     with pytest.raises(ValueError, match="Invalid OHLC range"):
         SimulationEngine(bundle)
+
+
+def test_formal_run_rejects_backfill_while_replay_allows_and_excludes_from_live_stats():
+    first, second = sessions(2)
+    bundle = make_bundle(
+        [first, second],
+        initial_routes={SECTOR: "TRANSITION"},
+        record_overrides={
+            SECTOR: [
+                {
+                    "record_id": "RH-BF-001",
+                    "decision_date": first,
+                    "effective_date": second,
+                    "prev_regime": "TRANSITION",
+                    "regime": "RANGE_GRID",
+                    "record_type": "BACKFILL",
+                    "recorded_at": None,
+                    "time_evidence_boundary": "4t03 backfill",
+                }
+            ]
+        },
+    )
+    formal = SimulationEngine(bundle, run_mode="formal")
+    with pytest.raises(ValueError, match="正式前瞻运行拒绝消费 BACKFILL"):
+        formal.run()
+    assert formal.daily_results == []
+
+    formal.step_day(first)
+    with pytest.raises(ValueError, match="正式前瞻运行拒绝消费 BACKFILL"):
+        formal.step_day(second)
+
+    replay = run_simulation(bundle, run_mode="replay")
+    assert len(replay.daily_results) == 2
+    assert replay.daily_results[0]["routed_positions"][SECTOR]["target_regime"] == "TRANSITION"
+    assert replay.daily_results[1]["routed_positions"][SECTOR]["target_regime"] == "RANGE_GRID"
+    stats = replay.daily_results[1]["routing_stats"]
+    assert stats["live_records_applied"] == 0
+    assert stats["backfill_records_excluded"] == 1
+    assert stats["backfill_record_ids"] == ["RH-BF-001"]
+
+
+def test_backfill_init_then_formal_live_resume_and_late_live_rejection():
+    day1, day2, day3 = sessions(3)
+    records = {
+        SECTOR: [
+            {
+                "record_id": "RH-BF-001",
+                "decision_date": day1,
+                "effective_date": day2,
+                "prev_regime": "TRANSITION",
+                "regime": "TRANSITION",
+                "record_type": "BACKFILL",
+                "recorded_at": None,
+                "time_evidence_boundary": "init backfill",
+            },
+            {
+                "record_id": "RH-LIVE-001",
+                "decision_date": day2,
+                "effective_date": day3,
+                "prev_regime": "TRANSITION",
+                "regime": "RANGE_GRID",
+                "record_type": "LIVE",
+                "recorded_at": f"{day2}T16:00:00+08:00",
+            },
+        ]
+    }
+    init_bundle = make_bundle(
+        [day1, day2, day3],
+        initial_routes={SECTOR: "TRANSITION"},
+        record_overrides=records,
+        forward_eval_start_date=day3,
+    )
+    init_engine = run_simulation(init_bundle, end_date=day2, run_mode="replay")
+    saved_state = json.loads(json.dumps(init_engine.export_state(), allow_nan=False))
+
+    formal_engine = SimulationEngine.from_state(
+        init_bundle, saved_state, run_mode="formal", forward_eval_start_date=day3
+    )
+    summary = formal_engine.run()
+    assert summary["processed_dates"] == [day3]
+    assert formal_engine.daily_results[0]["routed_positions"][SECTOR]["active_regime"] == "RANGE_GRID"
+    stats = summary["routing_stats"]
+    assert stats["live_records_applied"] == 1
+    assert stats["forward_live_records_applied"] == 1
+    assert stats["backfill_records_excluded"] == 1
+
+    # Late LIVE timestamp (>= 09:30+08:00 on effective_date) must fail formal run
+    late_records = json.loads(json.dumps(records))
+    late_records[SECTOR][1]["recorded_at"] = f"{day3}T09:30:00+08:00"
+    late_bundle = make_bundle(
+        [day1, day2, day3],
+        initial_routes={SECTOR: "TRANSITION"},
+        record_overrides=late_records,
+        forward_eval_start_date=day3,
+    )
+    with pytest.raises(ValueError, match="market open"):
+        SimulationEngine.from_state(late_bundle, saved_state, run_mode="formal").run()
