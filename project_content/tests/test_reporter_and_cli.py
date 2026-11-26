@@ -5,6 +5,7 @@ from __future__ import annotations
 import csv
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -15,6 +16,7 @@ import pytest
 from src.data_loader import (
     CHINA_TZ,
     DEFAULT_SIM_CONFIG_PATH,
+    _extract_decision_entry_block,
     compute_regime_decision_sha256,
     load_sim_config,
 )
@@ -46,13 +48,39 @@ def write_json(path, payload):
     path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8", newline="\n")
 
 
+_UNSET = object()
+
+
 def attach_live_proof(
     journal_dir: Path,
     record: dict,
     *,
     receipt_mtime: datetime | None = None,
-    entry_sha256: str | None = None,
+    entry_sha256: str | None | object = _UNSET,
 ) -> Path:
+    if entry_sha256 is _UNSET:
+        decision_ref = str(record.get("decision_ref") or "").strip()
+        if "#" not in decision_ref:
+            decision_ref = f"2026_decisions.md#{record['decision_date']}-{record['symbol']}"
+            record["decision_ref"] = decision_ref
+        ref_file, anchor_id = decision_ref.split("#", 1)
+        ref_path = journal_dir / ref_file
+        existing = ref_path.read_text(encoding="utf-8") if ref_path.is_file() else ""
+        marker = f'<a id="{anchor_id}"></a>'
+        if marker not in existing:
+            block_text = (
+                f"{marker}\n\n### [{record['decision_date']}] {record['symbol']}\n"
+                f"- {record.get('new_regime') or record.get('regime')}\n"
+            )
+            sep = "\n" if existing and not existing.endswith("\n") else ""
+            ref_path.parent.mkdir(parents=True, exist_ok=True)
+            ref_path.write_text(existing + sep + block_text, encoding="utf-8", newline="\n")
+        block = _extract_decision_entry_block(ref_path.read_text(encoding="utf-8"), anchor_id)
+        assert block is not None
+        resolved_entry_sha: str | None = hashlib.sha256(block.encode("utf-8")).hexdigest()
+    else:
+        resolved_entry_sha = entry_sha256  # type: ignore[assignment]
+
     recorded_dt = datetime.fromisoformat(record["recorded_at"].replace("Z", "+00:00")).astimezone(CHINA_TZ)
     decision_sha = compute_regime_decision_sha256(record, recorded_dt.isoformat())
     rel_path = f"pre_market_proofs/{record['record_id']}.json"
@@ -70,7 +98,8 @@ def attach_live_proof(
         "recorded_at": record["recorded_at"],
         "recorded_at_cst": recorded_dt.isoformat(),
         "decision_sha256": decision_sha,
-        "decision_entry_sha256": entry_sha256,
+        "decision_ref": record.get("decision_ref"),
+        "decision_entry_sha256": resolved_entry_sha,
     })
     ts_dt = receipt_mtime if receipt_mtime is not None else recorded_dt
     os.utime(receipt_path, (ts_dt.timestamp(), ts_dt.timestamp()))
@@ -996,3 +1025,125 @@ def test_cli_valid_replay_init_then_formal_resume_blocks_edit_delete_and_missing
     empty_out = tmp_path / "empty_out"
     assert cli_main(empty_inputs.args(empty_out, "--from-scratch", as_of="2026-11-26")) == 0
     assert cli_main(empty_inputs.args(empty_out, as_of="2026-11-27")) == 0
+
+
+def test_cli_formal_rejects_missing_ledger_anchor_empty_sha_or_tampered_text_without_writing(tmp_path, capsys):
+    inputs = make_inputs(tmp_path, include_live_records=False)
+    cfg = json.loads(inputs.config.read_text(encoding="utf-8"))
+    cfg["backfill_replay_window"] = None
+    cfg["forward_eval_start_date"] = None
+    write_json(inputs.config, cfg)
+    write_json(inputs.regimes, {
+        "schema_version": "2.0.0",
+        "anchor_start_date": START,
+        "initial_regimes": dict.fromkeys(SECTORS, "TRANSITION"),
+        "records": [],
+    })
+
+    out_resume = tmp_path / "resume_out"
+    assert cli_main(inputs.args(out_resume, "--from-scratch", as_of=START)) == 0
+    resume_before = output_bytes(out_resume)
+
+    decisions_path = tmp_path / "2026_decisions.md"
+    anchor_id = f"{START}-{GRID}"
+    valid_decisions = f'<a id="{anchor_id}"></a>\n\n### [{START}] {GRID}\n- RANGE_GRID\n'
+
+    def _write_live_case(decision_ref: str | None, *, entry_sha: str | None | object = _UNSET) -> Path:
+        rec: dict = {
+            "record_id": "RH-LIVE-ANCHOR-001",
+            "decision_date": START,
+            "effective_date": inputs.dates[1],
+            "symbol": GRID,
+            "prev_regime": "TRANSITION",
+            "new_regime": "RANGE_GRID",
+            "record_type": "LIVE",
+            "recorded_at": f"{START}T16:00:00+08:00",
+        }
+        if decision_ref is not None:
+            rec["decision_ref"] = decision_ref
+        receipt_p = attach_live_proof(
+            tmp_path,
+            rec,
+            receipt_mtime=datetime(2026, 11, 23, 16, 0, tzinfo=CHINA_TZ),
+            entry_sha256=entry_sha,
+        )
+        write_json(inputs.regimes, {
+            "schema_version": "2.0.0",
+            "anchor_start_date": START,
+            "initial_regimes": dict.fromkeys(SECTORS, "TRANSITION"),
+            "records": [rec],
+        })
+        return receipt_p
+
+    out_fresh = tmp_path / "fresh_out"
+
+    # 1. Missing #anchor (file name only / trailing # / empty) with null decision_entry_sha256 -> exit 2, no writes
+    decisions_path.write_text(valid_decisions, encoding="utf-8")
+    for bad_ref in ("2026_decisions.md", "2026_decisions.md#", "#anchor", ""):
+        _write_live_case(bad_ref, entry_sha=None)
+        assert cli_main(inputs.args(out_fresh, "--from-scratch", as_of=inputs.dates[1])) == 2
+        assert not out_fresh.exists()
+        assert cli_main(inputs.args(out_resume, as_of=inputs.dates[1])) == 2
+        assert output_bytes(out_resume) == resume_before
+        capsys.readouterr()
+
+    # 2. Valid #anchor syntax but decision ledger file missing (with null or non-null entry sha) -> exit 2, no writes
+    decisions_path.unlink()
+    for sha_val in (None, "a" * 64):
+        _write_live_case(f"2026_decisions.md#{anchor_id}", entry_sha=sha_val)
+        assert cli_main(inputs.args(out_fresh, "--from-scratch", as_of=inputs.dates[1])) == 2
+        assert not out_fresh.exists()
+        assert cli_main(inputs.args(out_resume, as_of=inputs.dates[1])) == 2
+        assert output_bytes(out_resume) == resume_before
+        capsys.readouterr()
+
+    # 3. Ledger exists, #anchor missing -> exit 2, no writes
+    decisions_path.write_text("# empty decisions\n", encoding="utf-8")
+    _write_live_case(f"2026_decisions.md#{anchor_id}", entry_sha="a" * 64)
+    assert cli_main(inputs.args(out_fresh, "--from-scratch", as_of=inputs.dates[1])) == 2
+    assert not out_fresh.exists()
+    assert cli_main(inputs.args(out_resume, as_of=inputs.dates[1])) == 2
+    assert output_bytes(out_resume) == resume_before
+    capsys.readouterr()
+
+    # 4. Valid anchor + receipt, then set decision_entry_sha256=None/"" or tamper text -> exit 2, no writes
+    decisions_path.write_text(valid_decisions, encoding="utf-8")
+    receipt_p = _write_live_case(f"2026_decisions.md#{anchor_id}")
+    saved_receipt = json.loads(receipt_p.read_text(encoding="utf-8"))
+    for empty_val in (None, ""):
+        bad_receipt = dict(saved_receipt)
+        bad_receipt["decision_entry_sha256"] = empty_val
+        write_json(receipt_p, bad_receipt)
+        os.utime(receipt_p, (datetime(2026, 11, 23, 16, 0, tzinfo=CHINA_TZ).timestamp(),) * 2)
+        assert cli_main(inputs.args(out_fresh, "--from-scratch", as_of=inputs.dates[1])) == 2
+        assert "decision_entry_sha256" in capsys.readouterr().err
+        assert not out_fresh.exists()
+        assert cli_main(inputs.args(out_resume, as_of=inputs.dates[1])) == 2
+        assert output_bytes(out_resume) == resume_before
+        capsys.readouterr()
+    write_json(receipt_p, saved_receipt)
+    os.utime(receipt_p, (datetime(2026, 11, 23, 16, 0, tzinfo=CHINA_TZ).timestamp(),) * 2)
+
+    # Also reject if pre_market_proof pointer itself embeds empty/null decision_entry_sha256
+    reg_payload = json.loads(inputs.regimes.read_text(encoding="utf-8"))
+    reg_payload["records"][0]["pre_market_proof"]["decision_entry_sha256"] = None
+    write_json(inputs.regimes, reg_payload)
+    assert cli_main(inputs.args(out_fresh, "--from-scratch", as_of=inputs.dates[1])) == 2
+    assert not out_fresh.exists()
+    assert cli_main(inputs.args(out_resume, as_of=inputs.dates[1])) == 2
+    assert output_bytes(out_resume) == resume_before
+    capsys.readouterr()
+    reg_payload["records"][0]["pre_market_proof"].pop("decision_entry_sha256", None)
+    write_json(inputs.regimes, reg_payload)
+
+    decisions_path.write_text(valid_decisions.replace("RANGE_GRID", "TRAP_OFF"), encoding="utf-8")
+    assert cli_main(inputs.args(out_fresh, "--from-scratch", as_of=inputs.dates[1])) == 2
+    assert "decision_entry_sha256" in capsys.readouterr().err
+    assert not out_fresh.exists()
+    assert cli_main(inputs.args(out_resume, as_of=inputs.dates[1])) == 2
+    assert output_bytes(out_resume) == resume_before
+    capsys.readouterr()
+
+    # 5. Restored valid text passes formal CLI cleanly
+    decisions_path.write_text(valid_decisions, encoding="utf-8")
+    assert cli_main(inputs.args(out_resume, as_of=inputs.dates[1])) == 0

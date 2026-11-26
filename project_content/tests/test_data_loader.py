@@ -357,13 +357,41 @@ def test_real_512480_split_adjustment_comes_from_the_ledger() -> None:
     assert adjusted.loc["2026-07-03", "adj_factor"] == pytest.approx(1.0)
 
 
+_UNSET = object()
+
+
 def _attach_live_proof(
     journal_dir: Path,
     record: dict,
     *,
     receipt_mtime: datetime | None = None,
-    entry_sha256: str | None = None,
+    entry_sha256: str | None | object = _UNSET,
 ) -> Path:
+    from src.data_loader import _extract_decision_entry_block
+
+    if entry_sha256 is _UNSET:
+        decision_ref = str(record.get("decision_ref") or "").strip()
+        if "#" not in decision_ref:
+            decision_ref = f"2026_decisions.md#{record['decision_date']}-{record['symbol']}"
+            record["decision_ref"] = decision_ref
+        ref_file, anchor_id = decision_ref.split("#", 1)
+        ref_path = journal_dir / ref_file
+        existing = ref_path.read_text(encoding="utf-8") if ref_path.is_file() else ""
+        marker = f'<a id="{anchor_id}"></a>'
+        if marker not in existing:
+            block_text = (
+                f"{marker}\n\n### [{record['decision_date']}] {record['symbol']}\n"
+                f"- {record.get('new_regime') or record.get('regime')}\n"
+            )
+            sep = "\n" if existing and not existing.endswith("\n") else ""
+            ref_path.parent.mkdir(parents=True, exist_ok=True)
+            ref_path.write_text(existing + sep + block_text, encoding="utf-8", newline="\n")
+        block = _extract_decision_entry_block(ref_path.read_text(encoding="utf-8"), anchor_id)
+        assert block is not None
+        resolved_entry_sha: str | None = hashlib.sha256(block.encode("utf-8")).hexdigest()
+    else:
+        resolved_entry_sha = entry_sha256  # type: ignore[assignment]
+
     recorded_dt = datetime.fromisoformat(record["recorded_at"].replace("Z", "+00:00")).astimezone(CHINA_TZ)
     recorded_cst = recorded_dt.isoformat()
     decision_sha = compute_regime_decision_sha256(record, recorded_cst)
@@ -382,7 +410,8 @@ def _attach_live_proof(
         "recorded_at": record["recorded_at"],
         "recorded_at_cst": recorded_cst,
         "decision_sha256": decision_sha,
-        "decision_entry_sha256": entry_sha256,
+        "decision_ref": record.get("decision_ref"),
+        "decision_entry_sha256": resolved_entry_sha,
     }
     _write_json(receipt_path, receipt)
     ts_dt = receipt_mtime if receipt_mtime is not None else recorded_dt
@@ -636,6 +665,107 @@ def test_regime_history_git_proof_anchor_binding_and_in_memory_validation(tmp_pa
         source_path=None,
     )
     in_memory_valid.validate_for_run_mode("formal", ["2026-11-23", "2026-11-24"])
+
+
+def test_file_backed_live_proof_requires_decision_ref_anchor_ledger_and_entry_sha256(tmp_path: Path) -> None:
+    journal = tmp_path / "journal"
+    journal.mkdir(parents=True)
+    decisions = journal / "2026_decisions.md"
+    valid_decisions = '<a id="2026-11-23-510720.SH"></a>\n\n### 510720.SH\n- RANGE_GRID\n'
+    decisions.write_text(valid_decisions, encoding="utf-8")
+
+    def _make_record(decision_ref: str | None) -> dict:
+        rec: dict = {
+            "record_id": "RH-20261123-001",
+            "decision_date": "2026-11-23",
+            "effective_date": "2026-11-24",
+            "symbol": "510720.SH",
+            "prev_regime": "TRANSITION",
+            "new_regime": "RANGE_GRID",
+            "record_type": "LIVE",
+            "recorded_at": "2026-11-23T16:00:00+08:00",
+        }
+        if decision_ref is not None:
+            rec["decision_ref"] = decision_ref
+        return rec
+
+    history_path = journal / "regime_history.json"
+
+    def _write_history(rec: dict) -> None:
+        _write_json(
+            history_path,
+            {
+                "schema_version": "2.0.0",
+                "anchor_start_date": "2026-11-23",
+                "initial_regimes": {"510720.SH": "TRANSITION"},
+                "records": [rec],
+            },
+        )
+
+    # 1. Missing decision_ref / missing #anchor / empty file or anchor (even with valid hex or null entry sha)
+    valid_sha = hashlib.sha256(valid_decisions.strip().encode("utf-8")).hexdigest()
+    for bad_ref in (None, "", "2026_decisions.md", "2026_decisions.md#", "#2026-11-23-510720.SH"):
+        for sha_val in (None, "", valid_sha):
+            rec = _make_record(bad_ref)
+            _attach_live_proof(
+                journal,
+                rec,
+                receipt_mtime=datetime(2026, 11, 23, 16, 0, 0, tzinfo=CHINA_TZ),
+                entry_sha256=sha_val,
+            )
+            _write_history(rec)
+            with pytest.raises(ValueError, match="decision_ref|decision_entry_sha256"):
+                load_regime_history(history_path, trading_calendar=ISO_DAYS)
+
+    # 2. Missing ledger file or missing anchor block in ledger file
+    rec_missing_anchor = _make_record("2026_decisions.md#MISSING-ANCHOR")
+    _attach_live_proof(
+        journal,
+        rec_missing_anchor,
+        receipt_mtime=datetime(2026, 11, 23, 16, 0, 0, tzinfo=CHINA_TZ),
+        entry_sha256=valid_sha,
+    )
+    _write_history(rec_missing_anchor)
+    with pytest.raises(ValueError, match="anchor"):
+        load_regime_history(history_path, trading_calendar=ISO_DAYS)
+
+    # 3. Valid baseline passes, then missing ledger / null or empty entry sha / tampered text all fail
+    rec_ok = _make_record("2026_decisions.md#2026-11-23-510720.SH")
+    receipt_path = _attach_live_proof(
+        journal,
+        rec_ok,
+        receipt_mtime=datetime(2026, 11, 23, 16, 0, 0, tzinfo=CHINA_TZ),
+    )
+    _write_history(rec_ok)
+    loaded = load_regime_history(history_path, trading_calendar=ISO_DAYS)
+    loaded.validate_for_run_mode("formal", ["2026-11-23", "2026-11-24"])
+
+    saved_receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+    for empty_val in (None, ""):
+        bad_receipt = dict(saved_receipt)
+        bad_receipt["decision_entry_sha256"] = empty_val
+        _write_json(receipt_path, bad_receipt)
+        os.utime(receipt_path, (datetime(2026, 11, 23, 16, 0, 0, tzinfo=CHINA_TZ).timestamp(),) * 2)
+        with pytest.raises(ValueError, match="decision_entry_sha256"):
+            load_regime_history(history_path, trading_calendar=ISO_DAYS)
+        with pytest.raises(ValueError, match="decision_entry_sha256"):
+            loaded.validate_for_run_mode("formal", ["2026-11-23", "2026-11-24"])
+    _write_json(receipt_path, saved_receipt)
+    os.utime(receipt_path, (datetime(2026, 11, 23, 16, 0, 0, tzinfo=CHINA_TZ).timestamp(),) * 2)
+
+    # Tamper decision text after loading -> file-backed validate_for_run_mode must also reject
+    decisions.write_text(valid_decisions.replace("RANGE_GRID", "TRAP_OFF"), encoding="utf-8")
+    with pytest.raises(ValueError, match="decision_entry_sha256"):
+        load_regime_history(history_path, trading_calendar=ISO_DAYS)
+    with pytest.raises(ValueError, match="decision_entry_sha256"):
+        loaded.validate_for_run_mode("formal", ["2026-11-23", "2026-11-24"])
+
+    # Missing decision ledger file -> both load_regime_history and validate_for_run_mode reject
+    decisions.unlink()
+    with pytest.raises(ValueError, match="not found"):
+        load_regime_history(history_path, trading_calendar=ISO_DAYS)
+    with pytest.raises(ValueError, match="not found"):
+        loaded.validate_for_run_mode("formal", ["2026-11-23", "2026-11-24"])
 
 
 def test_tdx_latest_batch_deduplicates_and_validates_dates(tmp_path: Path) -> None:

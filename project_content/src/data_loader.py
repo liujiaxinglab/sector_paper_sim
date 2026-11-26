@@ -188,6 +188,41 @@ def _extract_decision_entry_block(decisions_text: str, anchor_id: str) -> str | 
     return "\n".join(lines[start_idx:end_idx]).strip()
 
 
+def _resolve_live_decision_entry_sha256(
+    raw_record: Mapping[str, Any],
+    *,
+    regime_path: Path,
+    label: str,
+) -> tuple[str, Path, str]:
+    """Validate that a file-backed LIVE decision_ref points to an existing ledger file and #anchor block."""
+    raw_ref = raw_record.get("decision_ref")
+    if not isinstance(raw_ref, str) or not raw_ref.strip() or "#" not in raw_ref:
+        raise ValueError(
+            f"{label} LIVE record decision_ref must include a ledger path and #anchor "
+            f"(e.g. '2026_decisions.md#2026-11-26-510720.SH'), got {raw_ref!r}"
+        )
+    decision_ref = raw_ref.strip()
+    ref_file, anchor_id = decision_ref.split("#", 1)
+    ref_file = ref_file.strip()
+    anchor_id = anchor_id.strip()
+    if not ref_file or not anchor_id:
+        raise ValueError(f"{label} LIVE record decision_ref is missing ledger file or #anchor: {decision_ref!r}")
+    if Path(ref_file).is_absolute():
+        raise ValueError(f"{label} decision_ref must be relative to journal directory: {decision_ref!r}")
+
+    journal_dir = regime_path.resolve().parent
+    ref_path = (journal_dir / ref_file).resolve()
+    if not ref_path.is_relative_to(journal_dir):
+        raise ValueError(f"{label} decision_ref escapes journal directory: {decision_ref!r}")
+    if not ref_path.is_file():
+        raise ValueError(f"{label} pre_market_proof decision_ref file not found: {ref_path}")
+
+    block = _extract_decision_entry_block(ref_path.read_text(encoding="utf-8"), anchor_id)
+    if block is None or not block.strip():
+        raise ValueError(f"{label} decision_ref anchor {anchor_id!r} not found in {ref_path}")
+    return hashlib.sha256(block.encode("utf-8")).hexdigest(), ref_path, anchor_id
+
+
 def _infer_radar_repo_root(regime_path: Path) -> Path | None:
     resolved = regime_path.resolve()
     if (
@@ -320,8 +355,6 @@ def _verify_live_pre_market_proof(
     prev_reg = _normalize_regime_for_hash(raw_record.get("prev_regime"))
     raw_new = raw_record.get("new_regime") if raw_record.get("new_regime") is not None else raw_record.get("regime")
     new_reg = _normalize_regime_for_hash(raw_new)
-    decision_ref = str(raw_record.get("decision_ref") or "").strip()
-    proof_entry_sha = proof.get("decision_entry_sha256")
     recorded_dt = _parse_tz_aware_iso_datetime(recorded_cst_iso, f"{label}.recorded_at")
 
     receipt_abs = _resolve_proof_receipt_path(regime_path, proof.get("receipt_path"))
@@ -358,33 +391,22 @@ def _verify_live_pre_market_proof(
         )
 
     entry_sha = receipt.get("decision_entry_sha256")
-    if proof_entry_sha is not None and proof_entry_sha != entry_sha:
+    if not isinstance(entry_sha, str) or not SHA256_PATTERN.fullmatch(entry_sha):
+        raise ValueError(f"{label} pre_market_proof decision_entry_sha256 is missing or invalid: {entry_sha!r}")
+    if "decision_entry_sha256" in proof and proof.get("decision_entry_sha256") != entry_sha:
         raise ValueError(f"{label} pre_market_proof.decision_entry_sha256 does not match receipt")
-    if decision_ref and "#" in decision_ref:
-        ref_file, anchor_id = decision_ref.split("#", 1)
-        journal_dir = regime_path.resolve().parent
-        ref_path = (journal_dir / ref_file).resolve()
-        if not ref_path.is_relative_to(journal_dir):
-            raise ValueError(f"{label} decision_ref escapes journal directory: {decision_ref!r}")
-        if entry_sha is not None:
-            if not isinstance(entry_sha, str) or not SHA256_PATTERN.fullmatch(entry_sha):
-                raise ValueError(f"{label} pre_market_proof decision_entry_sha256 has invalid format")
-            if not ref_path.is_file():
-                raise ValueError(f"{label} pre_market_proof decision_ref file not found: {ref_path}")
-            block = _extract_decision_entry_block(ref_path.read_text(encoding="utf-8"), anchor_id)
-            if block is None:
-                raise ValueError(f"{label} decision_ref anchor {anchor_id!r} not found in {ref_path}")
-            actual_entry_sha = hashlib.sha256(block.encode("utf-8")).hexdigest()
-            if actual_entry_sha != entry_sha:
-                raise ValueError(
-                    f"{label} pre_market_proof decision_entry_sha256 does not match frozen text ({anchor_id})"
-                )
-        elif ref_path.is_file():
-            raise ValueError(
-                f"{label} pre_market_proof must include decision_entry_sha256 when {ref_path.name} exists"
-            )
-    elif entry_sha is not None:
-        raise ValueError(f"{label} pre_market_proof includes decision_entry_sha256 without a valid decision_ref")
+    if "decision_ref" in receipt and receipt.get("decision_ref") != raw_record.get("decision_ref"):
+        raise ValueError(
+            f"{label} pre_market_proof receipt decision_ref ({receipt.get('decision_ref')!r}) "
+            f"does not match record ({raw_record.get('decision_ref')!r})"
+        )
+    actual_entry_sha, _, anchor_id = _resolve_live_decision_entry_sha256(
+        raw_record, regime_path=regime_path, label=label
+    )
+    if actual_entry_sha != entry_sha:
+        raise ValueError(
+            f"{label} pre_market_proof decision_entry_sha256 does not match frozen text ({anchor_id})"
+        )
 
     eff_dt = date.fromisoformat(effective_date)
     eff_open = datetime(
