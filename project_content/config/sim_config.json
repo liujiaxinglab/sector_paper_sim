@@ -1,8 +1,11 @@
 {
   "project_name": "sector_paper_sim",
+  "start_date": "2026-11-23",
   "upstream_paths": {
     "tdx_daily_dir": "D:/VibeCoding/Quant/QuantData/raw/tdx/vipdoc_parsed",
-    "dividend_events_file": "D:/VibeCoding/Quant/QuantData/reference/etf/corporate_actions/20261120/watchlist_dividend_events.json",
+    "trade_calendar_dir": "D:/VibeCoding/Quant/QuantData/raw/baostock/query_trade_dates",
+    "corporate_actions_ledger_file": "D:/VibeCoding/Quant/QuantData/reference/etf/corporate_actions/latest/corporate_actions_ledger.json",
+    "regime_history_file": "D:/VibeCoding/Quant/sector_radar/project_content/journal/regime_history.json",
     "watchlist_file": "D:/VibeCoding/Quant/sector_radar/project_content/config/watchlist.json"
   },
   "account_defaults": {
@@ -23,11 +26,11 @@
     "grid": {
       "step_mode": "atr20_locked",
       "atr_window": 20,
-      "step_min": 0.02,
-      "step_max": 0.05,
+      "min_step_pct": 0.015,
       "grid_levels_each_side": 4,
-      "total_slices": 5,
-      "initial_slices": 2
+      "total_slices": 8,
+      "initial_slices": 4,
+      "initial_position_ratio": 0.5
     }
   },
   "universe": {

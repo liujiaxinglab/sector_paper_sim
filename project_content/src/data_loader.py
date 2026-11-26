@@ -1,0 +1,945 @@
+"""Read-only upstream data loading and trading calendar alignment for sector_paper_sim.
+
+All functions in this module strictly perform read-only access against local
+config and upstream QuantData / sector_radar artifacts without mutating any
+upstream files or falling back to network sources.
+"""
+
+from __future__ import annotations
+
+from bisect import bisect_left
+from dataclasses import dataclass
+from datetime import date
+import json
+import math
+from pathlib import Path
+import re
+from typing import Any, Mapping, Sequence
+
+import numpy as np
+import pandas as pd
+
+REPO_ROOT = Path(__file__).resolve().parents[2]
+DEFAULT_SIM_CONFIG_PATH = REPO_ROOT / "project_content" / "config" / "sim_config.json"
+
+TDX_BATCH_CSV_PATTERN = re.compile(r"^\d{8}_\d{6}\.csv$")
+TRADE_CALENDAR_CSV_PATTERN = re.compile(r"^\d{8}_\d{6}\.csv$")
+ISO_DATE_PATTERN = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+CORPORATE_ACTIONS_SCHEMA_VERSION = "2.0.0"
+REGIME_HISTORY_SCHEMA_VERSION = "1.0.0"
+ROUTABLE_REGIMES: frozenset[str] = frozenset(
+    {"TREND_UP", "RANGE_GRID", "TRANSITION", "TRAP_OFF", "UNRATED"}
+)
+
+TDX_REQUIRED_COLUMNS: tuple[str, ...] = (
+    "date",
+    "open",
+    "high",
+    "low",
+    "close",
+    "amount",
+    "volume",
+)
+TDX_PRICE_COLUMNS: tuple[str, ...] = ("open", "high", "low", "close")
+TDX_NUMERIC_COLUMNS: tuple[str, ...] = (
+    "open",
+    "high",
+    "low",
+    "close",
+    "amount",
+    "volume",
+)
+
+ALLOWED_REGIMES: frozenset[str] = frozenset(
+    {
+        "BENCHMARK",
+        "TREND_UP",
+        "RANGE_GRID",
+        "TRANSITION",
+        "TRAP_OFF",
+        "UNRATED",
+    }
+)
+
+
+@dataclass(frozen=True)
+class RegimeHistory:
+    """Validated regime history with effective-date lookup semantics."""
+
+    schema_version: str
+    anchor_start_date: str
+    initial_regimes: dict[str, str]
+    records_by_symbol: dict[str, list[dict[str, str]]]
+
+    def regime_for(self, symbol: str, trade_date: str) -> str:
+        """Return the latest regime effective on ``trade_date`` for ``symbol``."""
+        resolved_date = _normalize_iso_date(trade_date, "trade_date")
+        if resolved_date < self.anchor_start_date:
+            raise ValueError(
+                f"trade_date {resolved_date} precedes regime-history anchor "
+                f"{self.anchor_start_date}"
+            )
+        if symbol not in self.initial_regimes:
+            raise KeyError(f"No initial regime for symbol {symbol!r}")
+
+        result = self.initial_regimes[symbol]
+        for record in self.records_by_symbol.get(symbol, []):
+            if record["effective_date"] > resolved_date:
+                break
+            result = record["regime"]
+        return result
+
+
+@dataclass(frozen=True)
+class CorporateActionsLedger:
+    """Normalized and validated QuantData corporate-actions ledger."""
+
+    schema_version: str
+    as_of: str
+    cash_dividends_by_symbol: dict[str, list[dict[str, Any]]]
+    splits_by_symbol: dict[str, list[dict[str, Any]]]
+
+
+@dataclass(frozen=True)
+class MarketBundle:
+    """Unified read-only market data, metadata, and QRI calendar alignment."""
+
+    config: dict[str, Any]
+    benchmark: str
+    sectors: list[str]
+    symbols: list[str]
+    bars: dict[str, pd.DataFrame]
+    adjusted_bars: dict[str, pd.DataFrame]
+    watchlist: dict[str, dict[str, Any]]
+    dividends: dict[str, dict[str, float]]
+    splits: dict[str, list[dict[str, Any]]]
+    regime_history: RegimeHistory
+    common_end_date: str
+    common_trading_dates: list[str]
+    authoritative_trading_dates: list[str]
+    suspension_dates_by_symbol: dict[str, list[str]]
+    lagged_dates_by_symbol: dict[str, list[str]]
+    metadata: dict[str, Any]
+
+    @property
+    def lag_warnings(self) -> list[dict[str, Any]]:
+        """Explicit warnings for symbols lagging behind the latest trading date."""
+        return self.metadata["lag_warnings"]
+
+
+def _read_json_object(path: Path, label: str) -> dict[str, Any]:
+    if not path.is_file():
+        raise FileNotFoundError(f"{label} not found: {path}")
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"Invalid JSON in {label} ({path}): {exc}") from exc
+    if not isinstance(payload, dict):
+        raise ValueError(f"Expected top-level JSON object in {label}: {path}")
+    return payload
+
+
+def _normalize_iso_date(raw_value: Any, label: str) -> str:
+    if not isinstance(raw_value, str):
+        raise ValueError(f"{label} must be a YYYY-MM-DD string, got {raw_value!r}")
+    text = raw_value.strip()
+    if not ISO_DATE_PATTERN.match(text):
+        raise ValueError(f"{label} must match YYYY-MM-DD, got {raw_value!r}")
+    try:
+        parsed = date.fromisoformat(text)
+    except ValueError as exc:
+        raise ValueError(f"{label} is not a valid calendar date: {raw_value!r}") from exc
+    return parsed.isoformat()
+
+
+def _parse_positive_float(raw_value: Any, label: str) -> float:
+    if isinstance(raw_value, bool) or raw_value in (None, ""):
+        raise ValueError(f"{label} must be a positive number, got {raw_value!r}")
+    try:
+        value = float(raw_value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{label} is not a valid number: {raw_value!r}") from exc
+    if not math.isfinite(value) or value <= 0.0:
+        raise ValueError(f"{label} must be finite and > 0, got {raw_value!r}")
+    return value
+
+
+def _validate_sim_config(config: Mapping[str, Any], source_label: str) -> dict[str, Any]:
+    required_top_keys = (
+        "project_name",
+        "upstream_paths",
+        "account_defaults",
+        "strategies",
+        "universe",
+    )
+    for key in required_top_keys:
+        if key not in config:
+            raise ValueError(f"Missing required config key '{key}' in {source_label}")
+
+    upstream = config["upstream_paths"]
+    if not isinstance(upstream, Mapping):
+        raise ValueError(f"'upstream_paths' must be a JSON object in {source_label}")
+    for key in (
+        "tdx_daily_dir",
+        "trade_calendar_dir",
+        "corporate_actions_ledger_file",
+        "regime_history_file",
+        "watchlist_file",
+    ):
+        val = upstream.get(key)
+        if not isinstance(val, str) or not val.strip():
+            raise ValueError(
+                f"'upstream_paths.{key}' must be a non-empty string in {source_label}"
+            )
+
+    if "start_date" not in config:
+        raise ValueError(f"Missing required config key 'start_date' in {source_label}")
+    _normalize_iso_date(config["start_date"], "start_date")
+
+    universe = config["universe"]
+    if not isinstance(universe, Mapping):
+        raise ValueError(f"'universe' must be a JSON object in {source_label}")
+    benchmark = universe.get("benchmark")
+    sectors = universe.get("sectors")
+    if not isinstance(benchmark, str) or not benchmark.strip():
+        raise ValueError(f"'universe.benchmark' must be a non-empty string in {source_label}")
+    if (
+        not isinstance(sectors, list)
+        or not sectors
+        or any(not isinstance(sym, str) or not sym.strip() for sym in sectors)
+    ):
+        raise ValueError(
+            f"'universe.sectors' must be a non-empty list of symbol strings in {source_label}"
+        )
+
+    return dict(config)
+
+
+def load_sim_config(
+    config_path: str | Path = DEFAULT_SIM_CONFIG_PATH,
+) -> dict[str, Any]:
+    """Load and validate sim_config.json."""
+    path = Path(config_path)
+    raw = _read_json_object(path, "sim_config")
+    return _validate_sim_config(raw, str(path))
+
+
+def find_latest_tdx_csv(tdx_daily_dir: str | Path, symbol: str) -> Path:
+    """Locate the latest YYYYMMDD_HHMMSS.csv batch file under {tdx_daily_dir}/{symbol}/."""
+    symbol_dir = Path(tdx_daily_dir) / symbol
+    if not symbol_dir.is_dir():
+        raise FileNotFoundError(
+            f"TDX daily directory not found for {symbol}: {symbol_dir}"
+        )
+
+    matched_files = sorted(
+        (
+            entry
+            for entry in symbol_dir.iterdir()
+            if entry.is_file() and TDX_BATCH_CSV_PATTERN.match(entry.name)
+        ),
+        key=lambda p: p.name,
+    )
+    if not matched_files:
+        raise FileNotFoundError(
+            f"No YYYYMMDD_HHMMSS.csv files found for {symbol} under {symbol_dir}"
+        )
+    return matched_files[-1]
+
+
+def load_tdx_daily(tdx_daily_dir: str | Path, symbol: str) -> pd.DataFrame:
+    """Load, clean, sort, deduplicate, and validate the latest TDX daily CSV for a symbol."""
+    csv_path = find_latest_tdx_csv(tdx_daily_dir, symbol)
+    raw_df = pd.read_csv(csv_path, dtype={"date": str})
+
+    missing_cols = [col for col in TDX_REQUIRED_COLUMNS if col not in raw_df.columns]
+    if missing_cols:
+        raise ValueError(
+            f"{symbol} TDX CSV missing required columns {missing_cols}: {csv_path}"
+        )
+    if raw_df.empty:
+        raise ValueError(f"{symbol} TDX CSV has no data rows: {csv_path}")
+
+    df = raw_df.loc[:, list(TDX_REQUIRED_COLUMNS)].copy()
+
+    raw_dates = df["date"].fillna("").astype(str).str.strip()
+    parsed_dates = pd.to_datetime(raw_dates, format="mixed", errors="coerce")
+    if parsed_dates.isna().any():
+        bad_count = int(parsed_dates.isna().sum())
+        raise ValueError(
+            f"{symbol} TDX CSV contains {bad_count} invalid date value(s): {csv_path}"
+        )
+    df["date"] = parsed_dates.dt.strftime("%Y-%m-%d").astype(str)
+
+    for col in TDX_NUMERIC_COLUMNS:
+        df[col] = pd.to_numeric(df[col], errors="coerce").astype(float)
+
+    for col in TDX_PRICE_COLUMNS:
+        values = df[col].to_numpy(dtype=float)
+        if not np.isfinite(values).all():
+            bad_count = int((~np.isfinite(values)).sum())
+            raise ValueError(
+                f"{symbol} TDX CSV contains {bad_count} NaN/non-finite value(s) in '{col}': {csv_path}"
+            )
+        if (values <= 0.0).any():
+            bad_count = int((values <= 0.0).sum())
+            raise ValueError(
+                f"{symbol} TDX CSV contains {bad_count} non-positive (<= 0) value(s) in '{col}': {csv_path}"
+            )
+
+    for col in ("amount", "volume"):
+        values = df[col].to_numpy(dtype=float)
+        if not np.isfinite(values).all():
+            bad_count = int((~np.isfinite(values)).sum())
+            raise ValueError(
+                f"{symbol} TDX CSV contains {bad_count} NaN/non-finite value(s) in '{col}': {csv_path}"
+            )
+        if (values < 0.0).any():
+            bad_count = int((values < 0.0).sum())
+            raise ValueError(
+                f"{symbol} TDX CSV contains {bad_count} negative value(s) in '{col}': {csv_path}"
+            )
+
+    df = (
+        df.sort_values("date", kind="mergesort")
+        .drop_duplicates(subset=["date"], keep="last")
+        .reset_index(drop=True)
+    )
+    df.attrs["symbol"] = symbol
+    df.attrs["source_csv"] = str(csv_path)
+    return df
+
+
+def _parse_split_events(raw_events: Any, symbol: str) -> list[dict[str, Any]]:
+    if raw_events is None:
+        return []
+    if not isinstance(raw_events, list):
+        raise ValueError(f"{symbol} split_events must be a list, got {type(raw_events).__name__}")
+
+    parsed: list[dict[str, Any]] = []
+    for idx, raw in enumerate(raw_events):
+        if not isinstance(raw, Mapping):
+            raise ValueError(f"{symbol} split_events[{idx}] must be an object")
+        effective_date = _normalize_iso_date(
+            raw.get("effective_date"), f"{symbol} split_events[{idx}].effective_date"
+        )
+        raw_record = raw.get("record_date")
+        record_date = (
+            _normalize_iso_date(raw_record, f"{symbol} split_events[{idx}].record_date")
+            if raw_record not in (None, "")
+            else None
+        )
+        factor = _parse_positive_float(
+            raw.get("factor"), f"{symbol} split_events[{idx}].factor"
+        )
+        parsed.append(
+            {
+                "effective_date": effective_date,
+                "record_date": record_date,
+                "factor": factor,
+                "ratio_desc": str(raw.get("ratio_desc") or ""),
+                "source": str(raw.get("source") or ""),
+                "note": str(raw.get("note") or ""),
+            }
+        )
+    parsed.sort(key=lambda ev: ev["effective_date"])
+    return parsed
+
+
+def load_watchlist(watchlist_file: str | Path) -> dict[str, dict[str, Any]]:
+    """Load watchlist.json indexed by symbol with validated regime and split_events."""
+    path = Path(watchlist_file)
+    payload = _read_json_object(path, "watchlist_file")
+    universe = payload.get("universe")
+    if not isinstance(universe, list) or not universe:
+        raise ValueError(f"watchlist 'universe' must be a non-empty list: {path}")
+
+    result: dict[str, dict[str, Any]] = {}
+    for idx, item in enumerate(universe):
+        if not isinstance(item, Mapping):
+            raise ValueError(f"watchlist universe[{idx}] must be a JSON object: {path}")
+        raw_symbol = item.get("symbol")
+        if not isinstance(raw_symbol, str) or not raw_symbol.strip():
+            raise ValueError(f"watchlist universe[{idx}] missing valid 'symbol': {path}")
+        symbol = raw_symbol.strip()
+        if symbol in result:
+            raise ValueError(f"Duplicate symbol '{symbol}' in watchlist: {path}")
+
+        raw_regime = item.get("current_regime")
+        if not isinstance(raw_regime, str) or raw_regime.strip() not in ALLOWED_REGIMES:
+            raise ValueError(
+                f"{symbol} has unsupported current_regime {raw_regime!r}; "
+                f"allowed={sorted(ALLOWED_REGIMES)}"
+            )
+        regime = raw_regime.strip()
+
+        split_events = _parse_split_events(item.get("split_events"), symbol)
+        result[symbol] = {
+            "symbol": symbol,
+            "name": str(item.get("name") or ""),
+            "role": str(item.get("role") or ""),
+            "current_regime": regime,
+            "split_events": split_events,
+        }
+    return result
+
+
+def _normalized_regime(raw_value: Any, label: str) -> str:
+    if not isinstance(raw_value, str) or raw_value.strip() not in ROUTABLE_REGIMES:
+        raise ValueError(
+            f"{label} must be one of {sorted(ROUTABLE_REGIMES)}, got {raw_value!r}"
+        )
+    value = raw_value.strip()
+    return "TRANSITION" if value == "UNRATED" else value
+
+
+def load_corporate_actions_ledger(
+    ledger_file: str | Path,
+) -> CorporateActionsLedger:
+    """Load and validate the versioned QuantData corporate-actions ledger."""
+    path = Path(ledger_file)
+    payload = _read_json_object(path, "corporate_actions_ledger_file")
+    schema_version = payload.get("schema_version")
+    if schema_version != CORPORATE_ACTIONS_SCHEMA_VERSION:
+        raise ValueError(
+            f"Unsupported corporate-actions schema_version {schema_version!r} "
+            f"in {path}; expected {CORPORATE_ACTIONS_SCHEMA_VERSION!r}"
+        )
+    as_of = _normalize_iso_date(payload.get("as_of"), "corporate_actions.as_of")
+
+    dividends_raw = payload.get("cash_dividends_by_symbol")
+    splits_raw = payload.get("splits_by_symbol")
+    if not isinstance(dividends_raw, Mapping):
+        raise ValueError(
+            f"Missing or invalid 'cash_dividends_by_symbol' object in {path}"
+        )
+    if not isinstance(splits_raw, Mapping):
+        raise ValueError(f"Missing or invalid 'splits_by_symbol' object in {path}")
+
+    def parse_symbol_map(
+        raw_map: Mapping[str, Any], *, event_kind: str
+    ) -> dict[str, list[dict[str, Any]]]:
+        parsed_map: dict[str, list[dict[str, Any]]] = {}
+        date_key = "ex_date" if event_kind == "dividend" else "effective_date"
+        value_key = "cash_per_unit" if event_kind == "dividend" else "factor"
+        map_name = (
+            "cash_dividends_by_symbol" if event_kind == "dividend" else "splits_by_symbol"
+        )
+
+        for raw_symbol, raw_events in raw_map.items():
+            if not isinstance(raw_symbol, str) or not raw_symbol.strip():
+                raise ValueError(f"Invalid symbol key in {map_name}: {raw_symbol!r}")
+            symbol = raw_symbol.strip()
+            if not isinstance(raw_events, list):
+                raise ValueError(f"{symbol} entry in {map_name} must be a list: {path}")
+
+            parsed_events: list[dict[str, Any]] = []
+            for idx, raw_event in enumerate(raw_events):
+                if not isinstance(raw_event, Mapping):
+                    raise ValueError(
+                        f"{symbol} {event_kind}[{idx}] must be an object in {path}"
+                    )
+                event_date = _normalize_iso_date(
+                    raw_event.get(date_key),
+                    f"{symbol} {event_kind}[{idx}].{date_key}",
+                )
+                value = _parse_positive_float(
+                    raw_event.get(value_key),
+                    f"{symbol} {event_kind}[{idx}].{value_key}",
+                )
+                parsed_events.append({date_key: event_date, value_key: value})
+
+            parsed_events.sort(key=lambda event: event[date_key])
+            parsed_map[symbol] = parsed_events
+        return parsed_map
+
+    return CorporateActionsLedger(
+        schema_version=schema_version,
+        as_of=as_of,
+        cash_dividends_by_symbol=parse_symbol_map(dividends_raw, event_kind="dividend"),
+        splits_by_symbol=parse_symbol_map(splits_raw, event_kind="split"),
+    )
+
+
+def load_regime_history(regime_history_file: str | Path) -> RegimeHistory:
+    """Load route history and expose deterministic effective-date lookup."""
+    path = Path(regime_history_file)
+    payload = _read_json_object(path, "regime_history_file")
+    schema_version = payload.get("schema_version")
+    if schema_version != REGIME_HISTORY_SCHEMA_VERSION:
+        raise ValueError(
+            f"Unsupported regime-history schema_version {schema_version!r} in {path}; "
+            f"expected {REGIME_HISTORY_SCHEMA_VERSION!r}"
+        )
+    anchor = _normalize_iso_date(
+        payload.get("anchor_start_date"), "regime_history.anchor_start_date"
+    )
+    raw_initial = payload.get("initial_regimes")
+    if not isinstance(raw_initial, Mapping) or not raw_initial:
+        raise ValueError(f"Missing or invalid 'initial_regimes' object in {path}")
+
+    initial: dict[str, str] = {}
+    for raw_symbol, raw_regime in raw_initial.items():
+        if not isinstance(raw_symbol, str) or not raw_symbol.strip():
+            raise ValueError(f"Invalid symbol key in regime_history.initial_regimes: {raw_symbol!r}")
+        symbol = raw_symbol.strip()
+        if symbol in initial:
+            raise ValueError(f"Duplicate initial regime symbol {symbol!r} in {path}")
+        initial[symbol] = _normalized_regime(
+            raw_regime, f"regime_history.initial_regimes[{symbol}]"
+        )
+
+    raw_records = payload.get("records")
+    if not isinstance(raw_records, list):
+        raise ValueError(f"Missing or invalid 'records' list in {path}")
+    records_by_symbol: dict[str, list[dict[str, str]]] = {
+        symbol: [] for symbol in initial
+    }
+    seen: set[tuple[str, str]] = set()
+    for idx, raw_record in enumerate(raw_records):
+        if not isinstance(raw_record, Mapping):
+            raise ValueError(f"regime_history.records[{idx}] must be an object in {path}")
+        raw_symbol = raw_record.get("symbol")
+        if not isinstance(raw_symbol, str) or not raw_symbol.strip():
+            raise ValueError(f"regime_history.records[{idx}].symbol is invalid in {path}")
+        symbol = raw_symbol.strip()
+        if symbol not in initial:
+            raise ValueError(
+                f"regime_history.records[{idx}] symbol {symbol!r} has no initial regime"
+            )
+        effective_date = _normalize_iso_date(
+            raw_record.get("effective_date"),
+            f"regime_history.records[{idx}].effective_date",
+        )
+        if effective_date < anchor:
+            raise ValueError(
+                f"regime_history.records[{idx}] effective_date {effective_date} "
+                f"precedes anchor {anchor}"
+            )
+        if (symbol, effective_date) in seen:
+            raise ValueError(
+                f"Duplicate regime effective_date {effective_date} for {symbol} in {path}"
+            )
+        seen.add((symbol, effective_date))
+        new_regime = _normalized_regime(
+            raw_record.get("new_regime"),
+            f"regime_history.records[{idx}].new_regime",
+        )
+        records_by_symbol[symbol].append(
+            {"effective_date": effective_date, "regime": new_regime}
+        )
+
+    for records in records_by_symbol.values():
+        records.sort(key=lambda record: record["effective_date"])
+    return RegimeHistory(
+        schema_version=schema_version,
+        anchor_start_date=anchor,
+        initial_regimes=initial,
+        records_by_symbol=records_by_symbol,
+    )
+
+
+def _read_trade_calendar(
+    trade_calendar_dir: str | Path,
+    start_date: str | None = None,
+    end_date: str | None = None,
+) -> tuple[list[str], Path, list[str]]:
+    """Read the newest valid BS-01 CSV covering the requested full date range."""
+    directory = Path(trade_calendar_dir)
+    if not directory.is_dir():
+        raise FileNotFoundError(f"trade_calendar_dir not found: {directory}")
+    candidates = sorted(
+        (
+            path
+            for path in directory.iterdir()
+            if path.is_file() and TRADE_CALENDAR_CSV_PATTERN.match(path.name)
+        ),
+        key=lambda path: path.name,
+        reverse=True,
+    )
+    if not candidates:
+        raise FileNotFoundError(
+            f"No YYYYMMDD_HHMMSS.csv BS-01 calendar files found under {directory}"
+        )
+
+    resolved_start = (
+        _normalize_iso_date(start_date, "calendar.start_date")
+        if start_date is not None
+        else None
+    )
+    resolved_end = (
+        _normalize_iso_date(end_date, "calendar.end_date")
+        if end_date is not None
+        else None
+    )
+    failures: list[str] = []
+    for path in candidates:
+        try:
+            frame = pd.read_csv(
+                path, dtype={"calendar_date": str, "is_trading_day": str}
+            )
+        except (OSError, pd.errors.ParserError, UnicodeDecodeError) as exc:
+            failures.append(f"{path.name}: {exc}")
+            continue
+        required = {"calendar_date", "is_trading_day"}
+        if not required.issubset(frame.columns):
+            failures.append(
+                f"{path.name}: missing columns {sorted(required - set(frame.columns))}"
+            )
+            continue
+        if frame.empty:
+            failures.append(f"{path.name}: no calendar rows")
+            continue
+
+        raw_dates = frame["calendar_date"].fillna("").astype(str).str.strip()
+        parsed_dates = pd.to_datetime(raw_dates, format="%Y-%m-%d", errors="coerce")
+        if parsed_dates.isna().any():
+            failures.append(f"{path.name}: invalid calendar_date values")
+            continue
+        dates = parsed_dates.dt.strftime("%Y-%m-%d").tolist()
+        if len(dates) != len(set(dates)):
+            failures.append(f"{path.name}: duplicate calendar_date values")
+            continue
+        if dates != sorted(dates):
+            failures.append(f"{path.name}: calendar_date values are not sorted")
+            continue
+        expected_days = pd.date_range(dates[0], dates[-1], freq="D").strftime(
+            "%Y-%m-%d"
+        ).tolist()
+        if dates != expected_days:
+            failures.append(f"{path.name}: calendar has missing calendar_date rows")
+            continue
+
+        flags = frame["is_trading_day"].fillna("").astype(str).str.strip()
+        if not flags.isin({"0", "1"}).all():
+            failures.append(f"{path.name}: is_trading_day must contain only 0/1")
+            continue
+        trading_dates = [dt for dt, flag in zip(dates, flags) if flag == "1"]
+        if not trading_dates:
+            failures.append(f"{path.name}: no is_trading_day == 1 rows")
+            continue
+        if resolved_start is not None and dates[0] > resolved_start:
+            failures.append(
+                f"{path.name}: begins at {dates[0]}, after required {resolved_start}"
+            )
+            continue
+        if resolved_end is not None and dates[-1] < resolved_end:
+            failures.append(
+                f"{path.name}: ends at {dates[-1]}, before required {resolved_end}"
+            )
+            continue
+        if resolved_start is not None and resolved_end is not None:
+            if not any(resolved_start <= dt <= resolved_end for dt in trading_dates):
+                failures.append(
+                    f"{path.name}: no trading days in required interval "
+                    f"{resolved_start}..{resolved_end}"
+                )
+                continue
+        return trading_dates, path, dates
+
+    detail = "; ".join(failures)
+    raise ValueError(
+        f"No valid BS-01 calendar covers the requested interval in {directory}. "
+        f"Checked {len(candidates)} file(s): {detail}"
+    )
+
+
+def load_trade_calendar(
+    trade_calendar_dir: str | Path,
+    start_date: str | None = None,
+    end_date: str | None = None,
+) -> list[str]:
+    """Load authoritative BS-01 dates with ``is_trading_day == 1``."""
+    trading_dates, _, _ = _read_trade_calendar(
+        trade_calendar_dir, start_date=start_date, end_date=end_date
+    )
+    if start_date is not None:
+        resolved_start = _normalize_iso_date(start_date, "calendar.start_date")
+        trading_dates = [dt for dt in trading_dates if dt >= resolved_start]
+    if end_date is not None:
+        resolved_end = _normalize_iso_date(end_date, "calendar.end_date")
+        trading_dates = [dt for dt in trading_dates if dt <= resolved_end]
+    return trading_dates
+
+
+def build_forward_adjusted_daily(
+    raw_df: pd.DataFrame,
+    split_events: Sequence[Mapping[str, Any]] | None = None,
+    dividend_events: Mapping[str, float] | None = None,
+    cutoff_date: str | None = None,
+) -> pd.DataFrame:
+    """Compute forward-adjusted OHLC bars matching sector_radar's split + dividend formula.
+
+    The raw input DataFrame is never mutated. Prices on and after the last active
+    corporate action carry adj_factor == 1.0 so latest comparable prices match spot prices.
+    """
+    if raw_df.empty:
+        raise ValueError("Cannot build forward-adjusted bars from an empty DataFrame")
+
+    dates = raw_df["date"].astype(str).tolist()
+    n = len(dates)
+    resolved_cutoff = (
+        _normalize_iso_date(cutoff_date, "cutoff_date")
+        if cutoff_date is not None
+        else dates[-1]
+    )
+
+    split_multipliers = np.ones(n, dtype=float)
+    if split_events:
+        active_splits = [
+            ev
+            for ev in split_events
+            if _normalize_iso_date(ev["effective_date"], "split.effective_date")
+            <= resolved_cutoff
+        ]
+        for ev in active_splits:
+            eff_date = _normalize_iso_date(ev["effective_date"], "split.effective_date")
+            factor = _parse_positive_float(ev["factor"], "split.factor")
+            idx = bisect_left(dates, eff_date)
+            if idx > 0:
+                split_multipliers[:idx] *= factor
+
+    div_multipliers = np.ones(n, dtype=float)
+    if dividend_events:
+        raw_closes = raw_df["close"].to_numpy(dtype=float)
+        step_factors = np.ones(n, dtype=float)
+        has_active_div = False
+        for raw_ex_date, raw_cash in sorted(dividend_events.items()):
+            ex_date = _normalize_iso_date(raw_ex_date, "dividend.ex_date")
+            if ex_date > resolved_cutoff:
+                continue
+            cash = _parse_positive_float(raw_cash, f"dividend[{ex_date}].cash_per_unit")
+            idx = bisect_left(dates, ex_date)
+            if idx <= 0:
+                continue
+            prev_close = float(raw_closes[idx - 1])
+            if prev_close <= 0.0 or cash >= prev_close:
+                raise ValueError(
+                    f"Dividend on {ex_date} ({cash}) cannot be applied against prev_close={prev_close}"
+                )
+            step_factors[idx - 1] *= (prev_close - cash) / prev_close
+            has_active_div = True
+
+        if has_active_div:
+            running = 1.0
+            for i in range(n - 1, -1, -1):
+                running *= float(step_factors[i])
+                div_multipliers[i] = running
+
+    adj_factors = split_multipliers * div_multipliers
+    adj_df = raw_df.copy()
+    for col in TDX_PRICE_COLUMNS:
+        adj_df[col] = adj_df[col].to_numpy(dtype=float) * adj_factors
+    adj_df["adj_factor"] = adj_factors
+    return adj_df
+
+
+def load_market_bundle(config: Mapping[str, Any] | str | Path) -> MarketBundle:
+    """Load configured data and align it to the authoritative BS-01 calendar."""
+    resolved_config = (
+        load_sim_config(config)
+        if isinstance(config, (str, Path))
+        else _validate_sim_config(config, "config")
+    )
+
+    benchmark = resolved_config["universe"]["benchmark"].strip()
+    sectors = [sym.strip() for sym in resolved_config["universe"]["sectors"]]
+    symbols = [benchmark, *sectors]
+    if len(set(symbols)) != len(symbols):
+        raise ValueError(f"Duplicate symbols detected in universe: {symbols}")
+
+    upstream = resolved_config["upstream_paths"]
+    tdx_daily_dir = Path(upstream["tdx_daily_dir"])
+    watchlist_file = Path(upstream["watchlist_file"])
+    ledger_file = Path(upstream["corporate_actions_ledger_file"])
+    calendar_dir = Path(upstream["trade_calendar_dir"])
+    regime_history_file = Path(upstream["regime_history_file"])
+
+    watchlist = load_watchlist(watchlist_file)
+    missing_watchlist = [sym for sym in symbols if sym not in watchlist]
+    if missing_watchlist:
+        raise ValueError(
+            f"Universe symbol(s) missing from watchlist ({watchlist_file}): "
+            f"{missing_watchlist}"
+        )
+
+    ledger = load_corporate_actions_ledger(ledger_file)
+    missing_dividends = [
+        sym for sym in symbols if sym not in ledger.cash_dividends_by_symbol
+    ]
+    missing_splits = [sym for sym in symbols if sym not in ledger.splits_by_symbol]
+    if missing_dividends or missing_splits:
+        raise ValueError(
+            "Corporate-actions ledger does not cover the configured universe: "
+            f"missing dividends={missing_dividends}, missing splits={missing_splits}"
+        )
+
+    dividends: dict[str, dict[str, float]] = {}
+    splits: dict[str, list[dict[str, Any]]] = {}
+    for symbol in symbols:
+        cash_by_date: dict[str, float] = {}
+        for event in ledger.cash_dividends_by_symbol[symbol]:
+            ex_date = event["ex_date"]
+            cash_by_date[ex_date] = cash_by_date.get(ex_date, 0.0) + float(
+                event["cash_per_unit"]
+            )
+        dividends[symbol] = dict(sorted(cash_by_date.items()))
+        splits[symbol] = [dict(event) for event in ledger.splits_by_symbol[symbol]]
+        # Keep the pre-2t03 engine's watchlist shape while making the ledger the
+        # sole authoritative source of split events.
+        watchlist[symbol] = dict(watchlist[symbol])
+        watchlist[symbol]["split_events"] = [dict(event) for event in splits[symbol]]
+
+    regime_history = load_regime_history(regime_history_file)
+    missing_regimes = [sym for sym in sectors if sym not in regime_history.initial_regimes]
+    if missing_regimes:
+        raise ValueError(
+            f"Regime history is missing initial routes for configured sectors: "
+            f"{missing_regimes} ({regime_history_file})"
+        )
+
+    bars: dict[str, pd.DataFrame] = {
+        sym: load_tdx_daily(tdx_daily_dir, sym) for sym in symbols
+    }
+    end_dates = {sym: str(df["date"].iloc[-1]) for sym, df in bars.items()}
+    start_dates = {sym: str(df["date"].iloc[0]) for sym, df in bars.items()}
+    common_start_date = max(start_dates.values())
+    common_end_date = min(end_dates.values())
+    latest_end_date = max(end_dates.values())
+    if common_start_date > common_end_date:
+        raise ValueError(
+            "Configured symbols have no synchronized date interval: "
+            f"{common_start_date}..{common_end_date}"
+        )
+
+    all_calendar_dates, calendar_file, all_calendar_rows = _read_trade_calendar(
+        calendar_dir, start_date=common_start_date, end_date=latest_end_date
+    )
+    trading_calendar = [
+        dt for dt in all_calendar_dates if common_start_date <= dt <= latest_end_date
+    ]
+    if not trading_calendar:
+        raise ValueError(
+            f"No BS-01 trading dates cover {common_start_date}..{latest_end_date}"
+        )
+    calendar_set = set(all_calendar_dates)
+    for symbol, frame in bars.items():
+        off_calendar = sorted(set(frame["date"].tolist()) - calendar_set)
+        if off_calendar:
+            raise ValueError(
+                f"{symbol} TDX rows contain dates absent from the BS-01 calendar: "
+                f"{off_calendar[:5]}"
+            )
+
+    common_trading_dates = [
+        dt for dt in trading_calendar if dt <= common_end_date
+    ]
+    authoritative_trading_dates = trading_calendar
+    date_sets = {sym: set(df["date"].tolist()) for sym, df in bars.items()}
+
+    lag_warnings: list[dict[str, Any]] = []
+    lagged_dates_by_symbol: dict[str, list[str]] = {}
+    for symbol in symbols:
+        sym_end = end_dates[symbol]
+        lagged_dates = [
+            dt for dt in authoritative_trading_dates if sym_end < dt <= latest_end_date
+        ]
+        lagged_dates_by_symbol[symbol] = lagged_dates
+        if sym_end < latest_end_date:
+            lag_warnings.append(
+                {
+                    "symbol": symbol,
+                    "symbol_end_date": sym_end,
+                    "latest_end_date": latest_end_date,
+                    "lag_trading_days": len(lagged_dates),
+                    "message": (
+                        f"{symbol} latest CSV date {sym_end} lags behind "
+                        f"{latest_end_date} by {len(lagged_dates)} BS-01 trading day(s)"
+                    ),
+                }
+            )
+
+    suspension_dates_by_symbol = {
+        symbol: [
+            dt for dt in common_trading_dates if dt not in date_sets[symbol]
+        ]
+        for symbol in symbols
+    }
+    suspension_dates_by_symbol = {
+        symbol: dates
+        for symbol, dates in suspension_dates_by_symbol.items()
+        if dates
+    }
+    missing_trading_dates = {
+        symbol: [dt for dt in common_trading_dates if dt not in date_sets[symbol]]
+        for symbol in symbols
+    }
+    missing_trading_dates = {
+        symbol: dates for symbol, dates in missing_trading_dates.items() if dates
+    }
+
+    adjusted_bars: dict[str, pd.DataFrame] = {
+        symbol: build_forward_adjusted_daily(
+            bars[symbol],
+            split_events=splits[symbol],
+            dividend_events=dividends[symbol],
+            cutoff_date=common_end_date,
+        )
+        for symbol in symbols
+    }
+
+    source_files = {
+        sym: str(bars[sym].attrs.get("source_csv", "")) for sym in symbols
+    }
+    symbol_stats: dict[str, dict[str, Any]] = {
+        sym: {
+            "row_count": len(bars[sym]),
+            "start_date": start_dates[sym],
+            "end_date": end_dates[sym],
+            "latest_csv": Path(source_files[sym]).name if source_files[sym] else "",
+            "current_regime": watchlist[sym]["current_regime"],
+            "split_event_count": len(splits[sym]),
+            "dividend_event_count": len(ledger.cash_dividends_by_symbol[sym]),
+            "suspension_dates": suspension_dates_by_symbol.get(sym, []),
+            "lagged_dates": lagged_dates_by_symbol[sym],
+        }
+        for sym in symbols
+    }
+    metadata: dict[str, Any] = {
+        "common_start_date": common_start_date,
+        "common_end_date": common_end_date,
+        "latest_end_date": latest_end_date,
+        "common_trading_day_count": len(common_trading_dates),
+        "authoritative_trading_day_count": len(authoritative_trading_dates),
+        "lag_warnings": lag_warnings,
+        "suspension_dates_by_symbol": suspension_dates_by_symbol,
+        "lagged_dates_by_symbol": lagged_dates_by_symbol,
+        "missing_trading_dates": missing_trading_dates,
+        "missing_benchmark_dates": missing_trading_dates.get(benchmark, []),
+        "calendar_file": str(calendar_file),
+        "calendar_start_date": all_calendar_rows[0],
+        "calendar_end_date": all_calendar_rows[-1],
+        "corporate_actions_as_of": ledger.as_of,
+        "regime_history_anchor_start_date": regime_history.anchor_start_date,
+        "source_files": source_files,
+        "symbol_stats": symbol_stats,
+    }
+
+    return MarketBundle(
+        config=resolved_config,
+        benchmark=benchmark,
+        sectors=sectors,
+        symbols=symbols,
+        bars=bars,
+        adjusted_bars=adjusted_bars,
+        watchlist=watchlist,
+        dividends=dividends,
+        splits=splits,
+        regime_history=regime_history,
+        common_end_date=common_end_date,
+        common_trading_dates=common_trading_dates,
+        authoritative_trading_dates=authoritative_trading_dates,
+        suspension_dates_by_symbol=suspension_dates_by_symbol,
+        lagged_dates_by_symbol=lagged_dates_by_symbol,
+        metadata=metadata,
+    )

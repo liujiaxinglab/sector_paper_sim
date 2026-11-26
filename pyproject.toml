@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "sector-paper-sim"
+version = "0.2.0"
+description = "Daily-frequency deterministic paper-trading simulator with five parallel benchmark accounts (sector_radar routed)."
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "numpy",
+    "pandas",
+]
+
+[tool.setuptools]
+package-dir = { "" = "project_content" }
+packages = ["src"]
+
+[tool.pytest.ini_options]
+minversion = "8.0"
+# 相对路径以本文件所在目录（rootdir）为基准，因此无论从仓库根、project_content/ 还是任意外部目录
+# 配合 `-c <本文件>` 调用 pytest，均可解析 `from src.* import ...` 导入。
+pythonpath = ["project_content", "project_content/src"]
+testpaths = ["project_content/tests"]
+addopts = "-p no:cacheprovider"

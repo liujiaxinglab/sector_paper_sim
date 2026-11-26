@@ -2,3 +2,8 @@ __pycache__/
 *.pyc
 .pytest_cache/
 .vscode/
+*.egg-info/
+build/
+dist/
+
+# project_content/output/ 为受版本追踪的模拟产出目录（nav_daily.csv / trades.csv / state.json / 报告），严禁加入忽略规则。
