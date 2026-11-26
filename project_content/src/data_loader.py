@@ -10,10 +10,12 @@ from __future__ import annotations
 from bisect import bisect_left, bisect_right
 from dataclasses import dataclass
 from datetime import date, datetime, time, timedelta, timezone
+import hashlib
 import json
 import math
 from pathlib import Path
 import re
+import subprocess
 from typing import Any, Mapping, Sequence
 
 import numpy as np
@@ -26,7 +28,7 @@ TDX_BATCH_CSV_PATTERN = re.compile(r"^\d{8}_\d{6}\.csv$")
 TRADE_CALENDAR_CSV_PATTERN = re.compile(r"^\d{8}_\d{6}\.csv$")
 ISO_DATE_PATTERN = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 ISO_DATETIME_TZ_PATTERN = re.compile(
-    r"^\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})$"
+    r"^\d{4}-\d{2}-\d{2}[T ](?:[01]\d|2[0-3]):[0-5]\d:[0-5]\d(?:\.\d+)?(?:Z|([+-])([01]\d|2[0-3]):([0-5]\d))$"
 )
 SHA256_PATTERN = re.compile(r"^[0-9a-f]{64}$")
 CORPORATE_ACTIONS_SCHEMA_VERSION = "2.0.0"
@@ -73,9 +75,14 @@ def _parse_tz_aware_iso_datetime(raw_value: Any, label: str) -> datetime:
     if not isinstance(raw_value, str) or not raw_value.strip():
         raise ValueError(f"{label} must be a timezone-aware ISO 8601 timestamp, got {raw_value!r}")
     text = raw_value.strip()
-    if not ISO_DATETIME_TZ_PATTERN.fullmatch(text):
+    match = ISO_DATETIME_TZ_PATTERN.fullmatch(text)
+    if match is None:
         raise ValueError(
-            f"{label} must be a full timezone-aware ISO 8601 timestamp, got {raw_value!r}"
+            f"{label} must be a valid timezone-aware ISO 8601 timestamp, got {raw_value!r}"
+        )
+    if match.group(1) == "-" and match.group(2) == "00" and match.group(3) == "00":
+        raise ValueError(
+            f"{label} must not use invalid '-00:00' timezone offset, got {raw_value!r}"
         )
     try:
         parsed = datetime.fromisoformat(text)
@@ -111,6 +118,266 @@ def _validate_live_recorded_at(
     return recorded_cst.isoformat()
 
 
+def compute_regime_decision_sha256(raw_record: Mapping[str, Any], recorded_cst_iso: str) -> str:
+    """Compute canonical SHA-256 of a LIVE regime record matching sector_radar's attestation format."""
+    trigger_alerts = raw_record.get("trigger_alerts") if raw_record.get("has_trigger_alerts", "trigger_alerts" in raw_record) else None
+    payload = {
+        "record_id": str(raw_record.get("record_id") or "").strip(),
+        "decision_date": str(raw_record.get("decision_date") or "").strip(),
+        "effective_date": str(raw_record.get("effective_date") or "").strip(),
+        "symbol": str(raw_record.get("symbol") or "").strip(),
+        "prev_regime": str(raw_record.get("raw_prev_regime", raw_record.get("prev_regime")) or "").strip(),
+        "new_regime": str(raw_record.get("raw_new_regime", raw_record.get("new_regime")) or "").strip(),
+        "record_type": str(raw_record.get("record_type") or "").strip(),
+        "recorded_at_cst": recorded_cst_iso,
+        "trigger_alerts": list(trigger_alerts) if isinstance(trigger_alerts, list) else trigger_alerts,
+        "card_path": raw_record.get("card_path"),
+        "decision_ref": raw_record.get("decision_ref"),
+    }
+    canonical = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def _extract_decision_entry_block(decisions_text: str, anchor_id: str) -> str | None:
+    normalized = decisions_text.replace("\r\n", "\n").replace("\r", "\n")
+    marker = f'<a id="{anchor_id}"></a>'
+    lines = normalized.splitlines()
+    start_idx: int | None = None
+    for idx, line in enumerate(lines):
+        if line.strip() == marker:
+            start_idx = idx
+            break
+    if start_idx is None:
+        return None
+    end_idx = len(lines)
+    for idx in range(start_idx + 1, len(lines)):
+        stripped = lines[idx].strip()
+        if stripped.startswith('<a id="') or stripped == "---" or stripped.startswith("## "):
+            end_idx = idx
+            break
+    return "\n".join(lines[start_idx:end_idx]).strip()
+
+
+def _infer_radar_repo_root(regime_path: Path) -> Path | None:
+    resolved = regime_path.resolve()
+    if (
+        len(resolved.parents) >= 3
+        and resolved.parent.name == "journal"
+        and resolved.parents[1].name == "project_content"
+    ):
+        return resolved.parents[2]
+    return None
+
+
+def _resolve_proof_receipt_path(regime_path: Path, raw_receipt_path: Any) -> Path:
+    if not isinstance(raw_receipt_path, str) or not raw_receipt_path.strip():
+        raise ValueError("pre_market_proof.receipt_path must be a non-empty relative path")
+    rel_text = raw_receipt_path.strip()
+    rel_path = Path(rel_text)
+    if rel_path.is_absolute():
+        raise ValueError(f"pre_market_proof.receipt_path must be relative, got {rel_text!r}")
+
+    journal_dir = regime_path.resolve().parent
+    candidate = (journal_dir / rel_path).resolve()
+    if candidate.is_relative_to(journal_dir) and candidate.is_file():
+        return candidate
+    repo_root = _infer_radar_repo_root(regime_path)
+    if repo_root is not None:
+        root_candidate = (repo_root / rel_path).resolve()
+        if root_candidate.is_relative_to(repo_root) and root_candidate.is_file():
+            return root_candidate
+        if not candidate.is_relative_to(journal_dir) and not root_candidate.is_relative_to(repo_root):
+            raise ValueError(f"pre_market_proof.receipt_path escapes repository root: {rel_text!r}")
+    elif not candidate.is_relative_to(journal_dir):
+        raise ValueError(f"pre_market_proof.receipt_path escapes journal directory: {rel_text!r}")
+    raise ValueError(f"Missing LIVE pre_market_proof receipt file: {candidate}")
+
+
+def _find_git_root(path: Path) -> Path | None:
+    resolved = path.resolve()
+    start = resolved if resolved.is_dir() else resolved.parent
+    for parent in (start, *start.parents):
+        if (parent / ".git").exists():
+            return parent
+    return None
+
+
+def _verify_receipt_pre_market_timestamp(
+    receipt_abs: Path,
+    eff_open: datetime,
+    label: str,
+) -> None:
+    git_root = _find_git_root(receipt_abs)
+    if git_root is not None:
+        try:
+            rel_posix = receipt_abs.resolve().relative_to(git_root.resolve()).as_posix()
+            status_proc = subprocess.run(
+                ["git", "-c", "core.quotePath=false", "-C", str(git_root), "status", "--porcelain", "--", rel_posix],
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                check=False,
+            )
+            log_proc = subprocess.run(
+                [
+                    "git",
+                    "-c",
+                    "core.quotePath=false",
+                    "-C",
+                    str(git_root),
+                    "log",
+                    "-n",
+                    "1",
+                    "--format=%H%x09%aI%x09%cI",
+                    "--",
+                    rel_posix,
+                ],
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                check=False,
+            )
+            if status_proc.returncode == 0 and log_proc.returncode == 0:
+                status_out = status_proc.stdout.strip()
+                log_out = log_proc.stdout.strip()
+                if log_out:
+                    _, author_iso, committer_iso = log_out.split("\t", 2)
+                    author_dt = _parse_tz_aware_iso_datetime(author_iso, f"{label}.git_author_date")
+                    committer_dt = _parse_tz_aware_iso_datetime(committer_iso, f"{label}.git_committer_date")
+                    if author_dt >= eff_open or committer_dt >= eff_open:
+                        raise ValueError(
+                            f"{label} pre_market_proof Git commit timestamp ({committer_dt.isoformat()}) "
+                            f"must precede effective_date market open ({eff_open.isoformat()})"
+                        )
+                    if not status_out:
+                        return
+        except OSError:
+            pass
+
+    mtime_dt = datetime.fromtimestamp(receipt_abs.stat().st_mtime, tz=CHINA_TZ)
+    if mtime_dt >= eff_open:
+        raise ValueError(
+            f"{label} pre_market_proof file write time ({mtime_dt.isoformat()}) "
+            f"must precede effective_date market open ({eff_open.isoformat()})"
+        )
+
+
+def _verify_live_pre_market_proof(
+    raw_record: Mapping[str, Any],
+    *,
+    regime_path: Path,
+    symbol: str,
+    decision_date: str,
+    effective_date: str,
+    recorded_cst_iso: str,
+    label: str,
+) -> dict[str, Any]:
+    proof = raw_record.get("pre_market_proof")
+    if not isinstance(proof, Mapping):
+        raise ValueError(f"{label} LIVE record missing verifiable pre_market_proof")
+    raw_sha = proof.get("decision_sha256")
+    if not isinstance(raw_sha, str) or not SHA256_PATTERN.fullmatch(raw_sha):
+        raise ValueError(f"{label}.pre_market_proof.decision_sha256 is invalid or missing")
+
+    expected_sha = compute_regime_decision_sha256({"symbol": symbol, **raw_record}, recorded_cst_iso)
+    if raw_sha != expected_sha:
+        raise ValueError(
+            f"{label}.pre_market_proof.decision_sha256 ({raw_sha}) does not match record payload ({expected_sha})"
+        )
+
+    receipt_abs = _resolve_proof_receipt_path(regime_path, proof.get("receipt_path"))
+    receipt = _read_json_object(receipt_abs, f"{label}.pre_market_proof.receipt")
+    expected_fields = {
+        "record_id": str(raw_record.get("record_id") or "").strip(),
+        "decision_date": decision_date,
+        "effective_date": effective_date,
+        "symbol": symbol,
+        "prev_regime": str(raw_record.get("raw_prev_regime", raw_record.get("prev_regime")) or "").strip(),
+        "new_regime": str(raw_record.get("raw_new_regime", raw_record.get("new_regime")) or "").strip(),
+        "record_type": "LIVE",
+        "decision_sha256": expected_sha,
+    }
+    for key, expected_val in expected_fields.items():
+        if str(receipt.get(key) or "").strip() != expected_val:
+            raise ValueError(
+                f"{label} pre_market_proof receipt field {key}={receipt.get(key)!r} "
+                f"does not match record {expected_val!r}"
+            )
+
+    recorded_dt = _parse_tz_aware_iso_datetime(recorded_cst_iso, f"{label}.recorded_at")
+    receipt_recorded_dt = _parse_tz_aware_iso_datetime(
+        receipt.get("recorded_at"), f"{label}.pre_market_proof.receipt.recorded_at"
+    )
+    if receipt_recorded_dt != recorded_dt:
+        raise ValueError(
+            f"{label} pre_market_proof receipt recorded_at ({receipt_recorded_dt.isoformat()}) "
+            f"does not match record ({recorded_dt.isoformat()})"
+        )
+
+    decision_ref = str(raw_record.get("decision_ref") or "").strip()
+    entry_sha = receipt.get("decision_entry_sha256")
+    if decision_ref and "#" in decision_ref:
+        ref_file, anchor_id = decision_ref.split("#", 1)
+        journal_dir = regime_path.resolve().parent
+        ref_path = (journal_dir / ref_file).resolve()
+        if not ref_path.is_relative_to(journal_dir):
+            raise ValueError(f"{label} decision_ref escapes journal directory: {decision_ref!r}")
+        if entry_sha is not None:
+            if not isinstance(entry_sha, str) or not SHA256_PATTERN.fullmatch(entry_sha):
+                raise ValueError(f"{label} pre_market_proof decision_entry_sha256 has invalid format")
+            if not ref_path.is_file():
+                raise ValueError(f"{label} pre_market_proof decision_ref file not found: {ref_path}")
+            block = _extract_decision_entry_block(ref_path.read_text(encoding="utf-8"), anchor_id)
+            if block is None:
+                raise ValueError(f"{label} decision_ref anchor {anchor_id!r} not found in {ref_path}")
+            actual_entry_sha = hashlib.sha256(block.encode("utf-8")).hexdigest()
+            if actual_entry_sha != entry_sha:
+                raise ValueError(
+                    f"{label} pre_market_proof decision_entry_sha256 does not match frozen text ({anchor_id})"
+                )
+        elif ref_path.is_file():
+            raise ValueError(
+                f"{label} pre_market_proof must include decision_entry_sha256 when {ref_path.name} exists"
+            )
+    elif entry_sha is not None:
+        raise ValueError(f"{label} pre_market_proof includes decision_entry_sha256 without a valid decision_ref")
+
+    eff_dt = date.fromisoformat(effective_date)
+    eff_open = datetime(
+        eff_dt.year, eff_dt.month, eff_dt.day, MARKET_OPEN_TIME.hour, MARKET_OPEN_TIME.minute, 0, tzinfo=CHINA_TZ
+    )
+    _verify_receipt_pre_market_timestamp(receipt_abs, eff_open, label)
+    return receipt
+
+
+def compute_backfill_digest(records: Sequence[Mapping[str, Any]]) -> str:
+    """Compute a deterministic SHA-256 digest binding the exact set and contents of BACKFILL records."""
+    canonical_items = [
+        {
+            "record_id": str(rec.get("record_id") or ""),
+            "symbol": str(rec.get("symbol") or ""),
+            "decision_date": str(rec.get("decision_date") or ""),
+            "effective_date": str(rec.get("effective_date") or ""),
+            "prev_regime": str(rec.get("raw_prev_regime", rec.get("prev_regime")) or ""),
+            "new_regime": str(rec.get("raw_new_regime", rec.get("new_regime", rec.get("regime"))) or ""),
+            "record_type": str(rec.get("record_type") or ""),
+            "recorded_at": rec.get("recorded_at"),
+            "time_evidence_boundary": rec.get("time_evidence_boundary"),
+        }
+        for rec in sorted(
+            records,
+            key=lambda item: (
+                str(item.get("effective_date") or ""),
+                str(item.get("decision_date") or ""),
+                str(item.get("record_id") or ""),
+                str(item.get("symbol") or ""),
+            ),
+        )
+    ]
+    payload = json.dumps(canonical_items, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
 @dataclass(frozen=True)
 class RegimeHistory:
     """Validated regime history with effective-date lookup and LIVE/BACKFILL provenance."""
@@ -119,6 +386,7 @@ class RegimeHistory:
     anchor_start_date: str
     initial_regimes: dict[str, str]
     records_by_symbol: dict[str, list[dict[str, Any]]]
+    source_path: Path | None = None
 
     def regime_for(self, symbol: str, trade_date: str) -> str:
         """Return the latest regime effective on ``trade_date`` for ``symbol``."""
@@ -164,24 +432,58 @@ class RegimeHistory:
             if record["effective_date"] == resolved_date
         ]
 
+    def backfill_records_through(self, trade_date: str) -> list[dict[str, Any]]:
+        """Return all BACKFILL records with effective_date <= ``trade_date``."""
+        resolved_date = _normalize_iso_date(trade_date, "trade_date")
+        return [
+            rec
+            for rec in self.all_records()
+            if rec.get("record_type") == "BACKFILL" and rec["effective_date"] <= resolved_date
+        ]
+
     def validate_for_run_mode(
         self,
         run_mode: str,
         processed_dates: Sequence[str],
         *,
         forward_eval_start_date: str | None = None,
+        last_processed_date: str | None = None,
+        backfill_replay_window: Mapping[str, Any] | None = None,
+        routing_checkpoint: Mapping[str, Any] | None = None,
+        has_checkpoint_state: bool = False,
     ) -> None:
         """Enforce formal forward-run vs explicit replay boundary on LIVE/BACKFILL records."""
         if run_mode not in {"formal", "replay"}:
             raise ValueError(f"Unsupported run_mode {run_mode!r}; expected 'formal' or 'replay'")
-        stepped_set = {
-            _normalize_iso_date(day, "processed_date") for day in processed_dates
-        }
+        stepped_list = sorted(
+            {_normalize_iso_date(day, "processed_date") for day in processed_dates}
+        )
+        stepped_set = set(stepped_list)
+        resolved_last = (
+            _normalize_iso_date(last_processed_date, "last_processed_date")
+            if last_processed_date is not None
+            else None
+        )
+        through_candidates = [*stepped_list]
+        if resolved_last is not None:
+            through_candidates.append(resolved_last)
+        through_date = max(through_candidates) if through_candidates else None
         eval_start = (
             _normalize_iso_date(forward_eval_start_date, "forward_eval_start_date")
             if forward_eval_start_date is not None
             else None
         )
+        win_start: str | None = None
+        win_end: str | None = None
+        if backfill_replay_window is not None:
+            win_start = _normalize_iso_date(
+                backfill_replay_window.get("start_date"), "backfill_replay_window.start_date"
+            )
+            win_end = _normalize_iso_date(
+                backfill_replay_window.get("end_date"), "backfill_replay_window.end_date"
+            )
+
+        active_backfills: list[dict[str, Any]] = []
         for symbol, records in sorted(self.records_by_symbol.items()):
             for idx, record in enumerate(records):
                 label = f"regime_history[{symbol}][{idx}]"
@@ -196,21 +498,79 @@ class RegimeHistory:
                 if record_type == "LIVE":
                     if not decision_date:
                         raise ValueError(f"{label} LIVE record lacks decision_date")
-                    _validate_live_recorded_at(
+                    recorded_cst_iso = _validate_live_recorded_at(
                         record.get("recorded_at"),
                         decision_date,
                         effective_date,
                         label,
                     )
+                    if self.source_path is not None:
+                        _verify_live_pre_market_proof(
+                            {"symbol": symbol, **record},
+                            regime_path=self.source_path,
+                            symbol=symbol,
+                            decision_date=decision_date,
+                            effective_date=effective_date,
+                            recorded_cst_iso=recorded_cst_iso,
+                            label=label,
+                        )
                 elif run_mode == "formal":
-                    if effective_date in stepped_set or (
-                        eval_start is not None and effective_date >= eval_start
-                    ):
+                    if eval_start is not None and effective_date >= eval_start:
                         raise ValueError(
                             f"正式前瞻运行拒绝消费 BACKFILL 路由记录: {symbol} "
                             f"{record.get('record_id') or '(no-id)'} effective_date={effective_date}; "
                             "历史回放或状态初始化请显式使用 --mode replay"
                         )
+                    if effective_date in stepped_set or (
+                        through_date is not None and effective_date <= through_date
+                    ):
+                        active_backfills.append({"symbol": symbol, **record})
+
+        if run_mode == "formal" and active_backfills:
+            if not has_checkpoint_state or resolved_last is None:
+                first_rec = active_backfills[0]
+                raise ValueError(
+                    f"正式前瞻运行拒绝消费 BACKFILL 路由记录: {first_rec['symbol']} "
+                    f"{first_rec.get('record_id') or '(no-id)'} effective_date={first_rec['effective_date']}; "
+                    "历史回放或状态初始化请显式使用 --mode replay"
+                )
+            for rec in active_backfills:
+                eff = rec["effective_date"]
+                if eff > resolved_last or eff in stepped_set:
+                    raise ValueError(
+                        f"正式前瞻运行拒绝消费 BACKFILL 路由记录: {rec['symbol']} "
+                        f"{rec.get('record_id') or '(no-id)'} effective_date={eff}; "
+                        "历史回放或状态初始化请显式使用 --mode replay"
+                    )
+                if win_start is not None and win_end is not None and not (win_start <= eff <= win_end):
+                    raise ValueError(
+                        f"正式前瞻运行拒绝沿用超出初始化回放区间({win_start}..{win_end})的 BACKFILL 路由记录: "
+                        f"{rec['symbol']} {rec.get('record_id') or '(no-id)'} effective_date={eff}"
+                    )
+
+            if not isinstance(routing_checkpoint, Mapping):
+                raise ValueError(
+                    "正式前瞻运行拒绝沿用未绑定 BACKFILL 初始化证明的旧检查点: "
+                    "请先以 --mode replay 完成初始化区间回放以生成可核验检查点"
+                )
+            verified_through = routing_checkpoint.get("verified_backfill_through_date")
+            verified_count = routing_checkpoint.get("verified_backfill_count")
+            verified_digest = routing_checkpoint.get("verified_backfill_digest")
+            expected_digest = compute_backfill_digest(active_backfills)
+            max_active_eff = max(rec["effective_date"] for rec in active_backfills)
+            if (
+                not isinstance(verified_through, str)
+                or verified_through < max_active_eff
+                or verified_through > resolved_last
+                or verified_count != len(active_backfills)
+                or verified_digest != expected_digest
+            ):
+                raise ValueError(
+                    "正式前瞻运行检测到检查点未覆盖或与当前 BACKFILL 台账不一致的路由记录"
+                    f"（检查点 count={verified_count!r}, through={verified_through!r}; "
+                    f"台账 count={len(active_backfills)}, max_effective={max_active_eff}）: "
+                    "新增或改写 BACKFILL 后必须显式通过 --mode replay 在初始化区间重放核验"
+                )
 
     def routing_stats_through(
         self,
@@ -841,6 +1201,8 @@ def load_regime_history(
             )
         seen.add((symbol, effective_date))
 
+        raw_prev_regime = str(raw_record.get("prev_regime") or "").strip()
+        raw_new_regime = str(raw_record.get("new_regime") or "").strip()
         prev_regime = _normalized_regime(
             raw_record.get("prev_regime"),
             f"{label}.prev_regime",
@@ -865,6 +1227,15 @@ def load_regime_history(
             )
             if raw_boundary is not None and (not isinstance(raw_boundary, str) or not raw_boundary.strip()):
                 raise ValueError(f"{label}.time_evidence_boundary must be non-empty if provided")
+            _verify_live_pre_market_proof(
+                raw_record,
+                regime_path=path,
+                symbol=symbol,
+                decision_date=decision_date,
+                effective_date=effective_date,
+                recorded_cst_iso=normalized_recorded_at,
+                label=label,
+            )
         else:
             if raw_recorded_at is None:
                 if not isinstance(raw_boundary, str) or not raw_boundary.strip():
@@ -886,9 +1257,16 @@ def load_regime_history(
                 "effective_date": effective_date,
                 "prev_regime": prev_regime,
                 "regime": new_regime,
+                "raw_prev_regime": raw_prev_regime,
+                "raw_new_regime": raw_new_regime,
                 "record_type": record_type,
                 "recorded_at": normalized_recorded_at,
                 "time_evidence_boundary": raw_boundary.strip() if isinstance(raw_boundary, str) else None,
+                "has_trigger_alerts": "trigger_alerts" in raw_record,
+                "trigger_alerts": list(raw_record["trigger_alerts"]) if isinstance(raw_record.get("trigger_alerts"), list) else raw_record.get("trigger_alerts"),
+                "card_path": raw_record.get("card_path"),
+                "decision_ref": raw_record.get("decision_ref"),
+                "pre_market_proof": raw_record.get("pre_market_proof"),
             }
         )
 
@@ -907,6 +1285,7 @@ def load_regime_history(
         anchor_start_date=anchor,
         initial_regimes=initial,
         records_by_symbol=records_by_symbol,
+        source_path=path.resolve(),
     )
 
 

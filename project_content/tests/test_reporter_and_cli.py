@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import csv
 from dataclasses import dataclass
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 import json
 import os
 from pathlib import Path
@@ -12,7 +12,12 @@ import subprocess
 
 import pytest
 
-from src.data_loader import DEFAULT_SIM_CONFIG_PATH, load_sim_config
+from src.data_loader import (
+    CHINA_TZ,
+    DEFAULT_SIM_CONFIG_PATH,
+    compute_regime_decision_sha256,
+    load_sim_config,
+)
 from src.engine import ACCOUNT_IDS
 from src.reporter import (
     NAV_CSV_COLUMNS,
@@ -39,6 +44,32 @@ QUANT_PYTHON = "C:/Users/jxing/.conda/envs/quant/python.exe"
 
 def write_json(path, payload):
     path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8", newline="\n")
+
+
+def attach_live_proof(journal_dir: Path, record: dict, *, receipt_mtime: datetime | None = None) -> Path:
+    recorded_dt = datetime.fromisoformat(record["recorded_at"].replace("Z", "+00:00")).astimezone(CHINA_TZ)
+    decision_sha = compute_regime_decision_sha256(record, recorded_dt.isoformat())
+    rel_path = f"pre_market_proofs/{record['record_id']}.json"
+    receipt_path = journal_dir / rel_path
+    receipt_path.parent.mkdir(parents=True, exist_ok=True)
+    write_json(receipt_path, {
+        "schema_version": "1.0.0",
+        "record_id": record["record_id"],
+        "decision_date": record["decision_date"],
+        "effective_date": record["effective_date"],
+        "symbol": record["symbol"],
+        "prev_regime": record["prev_regime"],
+        "new_regime": record["new_regime"],
+        "record_type": "LIVE",
+        "recorded_at": record["recorded_at"],
+        "recorded_at_cst": recorded_dt.isoformat(),
+        "decision_sha256": decision_sha,
+    })
+    mtime_dt = receipt_mtime if receipt_mtime is not None else recorded_dt
+    ts = mtime_dt.timestamp()
+    os.utime(receipt_path, (ts, ts))
+    record["pre_market_proof"] = {"receipt_path": rel_path, "decision_sha256": decision_sha}
+    return receipt_path
 
 
 def write_csv(path, header, rows):
@@ -128,6 +159,40 @@ def make_inputs(tmp_path: Path, *, lag_symbol=None, all_lag=False) -> Inputs:
         },
     })
     regimes = tmp_path / "regime_history.json"
+    regime_records = [
+        {
+            "record_id": "RH-TEST-001",
+            "decision_date": dates[1],
+            "effective_date": dates[2],
+            "symbol": GRID,
+            "prev_regime": "RANGE_GRID",
+            "new_regime": "TRANSITION",
+            "record_type": "LIVE",
+            "recorded_at": f"{dates[1]}T16:00:00+08:00",
+        },
+        {
+            "record_id": "RH-TEST-002",
+            "decision_date": dates[4],
+            "effective_date": dates[5],
+            "symbol": TREND,
+            "prev_regime": "TREND_UP",
+            "new_regime": "RANGE_GRID",
+            "record_type": "LIVE",
+            "recorded_at": f"{dates[4]}T16:00:00+08:00",
+        },
+        {
+            "record_id": "RH-TEST-003",
+            "decision_date": dates[6],
+            "effective_date": dates[7],
+            "symbol": UNRATED,
+            "prev_regime": "TRANSITION",
+            "new_regime": "TREND_UP",
+            "record_type": "LIVE",
+            "recorded_at": f"{dates[6]}T16:00:00+08:00",
+        },
+    ]
+    for rec in regime_records:
+        attach_live_proof(tmp_path, rec)
     write_json(regimes, {
         "schema_version": "2.0.0",
         "anchor_start_date": START,
@@ -137,38 +202,7 @@ def make_inputs(tmp_path: Path, *, lag_symbol=None, all_lag=False) -> Inputs:
             TREND: "TREND_UP",
             UNRATED: "UNRATED",
         },
-        "records": [
-            {
-                "record_id": "RH-TEST-001",
-                "decision_date": dates[1],
-                "effective_date": dates[2],
-                "symbol": GRID,
-                "prev_regime": "RANGE_GRID",
-                "new_regime": "TRANSITION",
-                "record_type": "LIVE",
-                "recorded_at": f"{dates[1]}T16:00:00+08:00",
-            },
-            {
-                "record_id": "RH-TEST-002",
-                "decision_date": dates[4],
-                "effective_date": dates[5],
-                "symbol": TREND,
-                "prev_regime": "TREND_UP",
-                "new_regime": "RANGE_GRID",
-                "record_type": "LIVE",
-                "recorded_at": f"{dates[4]}T16:00:00+08:00",
-            },
-            {
-                "record_id": "RH-TEST-003",
-                "decision_date": dates[6],
-                "effective_date": dates[7],
-                "symbol": UNRATED,
-                "prev_regime": "TRANSITION",
-                "new_regime": "TREND_UP",
-                "record_type": "LIVE",
-                "recorded_at": f"{dates[6]}T16:00:00+08:00",
-            },
-        ],
+        "records": regime_records,
     })
     config = tmp_path / "sim_config.json"
     contents = load_sim_config()
@@ -194,7 +228,9 @@ def test_daily_outputs_have_five_accounts_and_keep_only_the_checkpoint(tmp_path,
     last_date = inputs.dates[-1]
     assert cli_main(inputs.args(output, "--from-scratch", as_of=last_date)) == 0
     state = load_state_json(output / "state.json")
-    assert set(state) == {"schema_version", "start_date", "last_processed_date", "last_known_closes", "accounts"}
+    assert set(state) == {
+        "schema_version", "start_date", "last_processed_date", "last_known_closes", "routing_checkpoint", "accounts",
+    }
     assert state["start_date"] == START and state["last_processed_date"] == last_date
     assert set(state["accounts"]) == set(ACCOUNT_IDS)
     assert set(state["last_known_closes"]) == {BENCHMARK, *SECTORS}
@@ -481,6 +517,7 @@ def test_cli_formal_rejects_backfill_and_replay_reproduces_deterministically(tmp
     payload["records"][0]["record_type"] = "BACKFILL"
     payload["records"][0]["recorded_at"] = None
     payload["records"][0]["time_evidence_boundary"] = "synthetic backfill window"
+    payload["records"][0].pop("pre_market_proof", None)
     write_json(inputs.regimes, payload)
 
     formal_out = tmp_path / "formal_out"
@@ -508,6 +545,7 @@ def test_forward_excess_returns_exclude_backfill_initialization_period(tmp_path)
     payload["records"][0]["record_type"] = "BACKFILL"
     payload["records"][0]["recorded_at"] = None
     payload["records"][0]["time_evidence_boundary"] = "init backfill before forward eval"
+    payload["records"][0].pop("pre_market_proof", None)
     write_json(inputs.regimes, payload)
 
     cfg = json.loads(inputs.config.read_text(encoding="utf-8"))
@@ -602,25 +640,34 @@ def test_cross_repo_t_decision_t1_effective_synthesis_consistent_across_radar_an
 
     shared_regime = radar_repo / "project_content" / "journal" / "regime_history.json"
     shared_regime.parent.mkdir(parents=True, exist_ok=True)
+    decisions_md = radar_repo / "project_content" / "journal" / "2026_decisions.md"
+    decisions_md.write_text(
+        f'<a id="{friday}-{GRID}"></a>\n\n### [{friday}] {GRID}\n\n- 冻结：切换至 RANGE_GRID。\n',
+        encoding="utf-8",
+    )
+    live_record = {
+        "record_id": "RH-20261127-001",
+        "decision_date": friday,
+        "effective_date": monday,
+        "symbol": GRID,
+        "prev_regime": "TRANSITION",
+        "new_regime": "RANGE_GRID",
+        "record_type": "LIVE",
+        "recorded_at": "2026-11-27T16:00:00+08:00",
+        "trigger_alerts": ["[新触发] 20日跌破"],
+        "card_path": f"project_content/radar_cards/{GRID}_测试.md",
+        "decision_ref": f"2026_decisions.md#{friday}-{GRID}",
+    }
+    board.create_live_pre_market_proof(
+        shared_regime,
+        live_record,
+        receipt_mtime=datetime(2026, 11, 27, 16, 0, tzinfo=CHINA_TZ),
+    )
     write_json(shared_regime, {
         "schema_version": "2.0.0",
         "anchor_start_date": START,
         "initial_regimes": dict.fromkeys(SECTORS, "TRANSITION"),
-        "records": [
-            {
-                "record_id": "RH-20261127-001",
-                "decision_date": friday,
-                "effective_date": monday,
-                "symbol": GRID,
-                "prev_regime": "TRANSITION",
-                "new_regime": "RANGE_GRID",
-                "record_type": "LIVE",
-                "recorded_at": "2026-11-27T16:00:00+08:00",
-                "trigger_alerts": ["[新触发] 20日跌破"],
-                "card_path": f"project_content/radar_cards/{GRID}_测试.md",
-                "decision_ref": f"2026_decisions.md#{friday}-{GRID}",
-            }
-        ],
+        "records": [live_record],
     })
 
     shared_watchlist = radar_repo / "project_content" / "config" / "watchlist.json"
@@ -672,7 +719,9 @@ def test_cross_repo_t_decision_t1_effective_synthesis_consistent_across_radar_an
     write_json(inputs.config, sim_cfg)
     sim_out = tmp_path / "sim_out"
 
-    # On Friday (T): Radar board, watchlist, and Paper Sim all keep TRANSITION
+    # On Friday (T): public Radar CLI sync & board, plus Paper Sim CLI all keep TRANSITION
+    assert board.main(["--config", str(shared_watchlist), "--sync-watchlist-regime", "--as-of", friday]) == 0
+    assert board.main(["--config", str(shared_watchlist), "--as-of", friday, "--dry-run"]) == 0
     radar_friday = board.run_daily_board(config_path=shared_watchlist, as_of=friday, dry_run=True, repo_root=radar_repo)
     assert next(r for r in radar_friday["results"] if r["symbol"] == GRID)["current_regime"] == "TRANSITION"
     assert cli_main(inputs.args(sim_out, as_of=friday)) == 0
@@ -681,9 +730,11 @@ def test_cross_repo_t_decision_t1_effective_synthesis_consistent_across_radar_an
     assert sim_state_friday["positions"][GRID]["shares"] == 0
     assert [t for t in read_csv_rows(sim_out / "trades.csv", TRADES_CSV_COLUMNS) if t["account"] == "A"] == []
 
-    # On Monday (T+1): Radar syncs watchlist, board shows RANGE_GRID, Paper Sim opens RANGE_GRID
-    trade_dates, _ = board.load_trade_calendar(cal_dst)
-    board.sync_watchlist_regimes(shared_watchlist, shared_regime, trade_dates, radar_repo, as_of_date=date.fromisoformat(monday))
+    # On Monday (T+1): first public Radar CLI --sync-watchlist-regime --as-of monday returns 0, board shows RANGE_GRID, Paper Sim opens RANGE_GRID
+    assert board.main(["--config", str(shared_watchlist), "--sync-watchlist-regime", "--as-of", monday]) == 0
+    assert board.main(["--config", str(shared_watchlist), "--as-of", monday]) == 0
+    assert f"| `{GRID}` |" in (radar_repo / "project_content" / "output" / "board_latest.md").read_text(encoding="utf-8")
+    assert "`RANGE_GRID`" in (radar_repo / "project_content" / "output" / "board_latest.md").read_text(encoding="utf-8")
     radar_monday = board.run_daily_board(config_path=shared_watchlist, as_of=monday, dry_run=True, repo_root=radar_repo)
     assert next(r for r in radar_monday["results"] if r["symbol"] == GRID)["current_regime"] == "RANGE_GRID"
     assert cli_main(inputs.args(sim_out, as_of=monday)) == 0
@@ -692,3 +743,159 @@ def test_cross_repo_t_decision_t1_effective_synthesis_consistent_across_radar_an
     assert sim_state_monday["positions"][GRID]["shares"] > 0
     a_trades = [t for t in read_csv_rows(sim_out / "trades.csv", TRADES_CSV_COLUMNS) if t["account"] == "A"]
     assert [(t["date"], t["symbol"], t["action"]) for t in a_trades] == [(monday, GRID, "GRID_INIT_BUY")]
+
+
+def test_cli_formal_blocks_unproven_late_and_illegal_offset_live_records(tmp_path, capsys):
+    inputs = make_inputs(tmp_path)
+    base_regimes = {
+        "schema_version": "2.0.0",
+        "anchor_start_date": START,
+        "initial_regimes": dict.fromkeys(SECTORS, "TRANSITION"),
+        "records": [
+            {
+                "record_id": "RH-LIVE-EDGE-001",
+                "decision_date": START,
+                "effective_date": inputs.dates[1],
+                "symbol": GRID,
+                "prev_regime": "TRANSITION",
+                "new_regime": "RANGE_GRID",
+                "record_type": "LIVE",
+                "recorded_at": "2026-11-23T16:00:00+08:00",
+            }
+        ],
+    }
+
+    # 1. Missing pre_market_proof -> exit 2
+    write_json(inputs.regimes, base_regimes)
+    out = tmp_path / "out_missing"
+    assert cli_main(inputs.args(out, "--from-scratch", as_of=inputs.dates[1])) == 2
+    assert "pre_market_proof" in capsys.readouterr().err
+    assert not out.exists()
+
+    # 2. Post-market write (current wall-clock 2026-11-26 20:48+) with backfilled recorded_at -> exit 2
+    with_proof = json.loads(json.dumps(base_regimes))
+    attach_live_proof(tmp_path, with_proof["records"][0], receipt_mtime=datetime(2026, 11, 26, 20, 48, 0, tzinfo=CHINA_TZ))
+    write_json(inputs.regimes, with_proof)
+    assert cli_main(inputs.args(out, "--from-scratch", as_of=inputs.dates[1])) == 2
+    assert "market open" in capsys.readouterr().err
+
+    # 3. Illegal ISO offset +07:60 -> exit 2
+    bad_offset = json.loads(json.dumps(base_regimes))
+    bad_offset["records"][0]["recorded_at"] = "2026-11-23T16:00:00+07:60"
+    write_json(inputs.regimes, bad_offset)
+    assert cli_main(inputs.args(out, "--from-scratch", as_of=inputs.dates[1])) == 2
+    assert "ISO 8601" in capsys.readouterr().err
+
+    # 4. Exact market open (09:30:00+08:00) -> exit 2
+    at_open = json.loads(json.dumps(base_regimes))
+    at_open["records"][0]["recorded_at"] = f"{inputs.dates[1]}T09:30:00+08:00"
+    write_json(inputs.regimes, at_open)
+    assert cli_main(inputs.args(out, "--from-scratch", as_of=inputs.dates[1])) == 2
+    assert "market open" in capsys.readouterr().err
+
+    # 5. Valid UTC equivalent time (01:29:59Z = 09:29:59+08:00) + pre-market proof -> exit 0
+    utc_ok = json.loads(json.dumps(base_regimes))
+    utc_ok["records"][0]["recorded_at"] = f"{inputs.dates[1]}T01:29:59Z"
+    attach_live_proof(tmp_path, utc_ok["records"][0], receipt_mtime=datetime(2026, 11, 24, 9, 29, 59, tzinfo=CHINA_TZ))
+    write_json(inputs.regimes, utc_ok)
+    assert cli_main(inputs.args(out, "--from-scratch", as_of=inputs.dates[1])) == 0
+
+
+def test_cli_formal_resume_blocks_appended_prior_backfill_and_preserves_output_bytes(tmp_path, capsys):
+    """复现并回归问题 2：forward_eval_start_date=null 时，正式续跑严禁消费检查点之前新增/改写的 BACKFILL，且失败时输出目录保持原字节。"""
+    inputs = make_inputs(tmp_path)
+    friday = "2026-11-27"
+    monday = "2026-11-30"
+    tuesday = "2026-12-01"
+    cfg = json.loads(inputs.config.read_text(encoding="utf-8"))
+    cfg["backfill_replay_window"] = {"start_date": START, "end_date": "2026-11-26"}
+    cfg["forward_eval_start_date"] = None
+    write_json(inputs.config, cfg)
+
+    write_json(inputs.regimes, {
+        "schema_version": "2.0.0",
+        "anchor_start_date": START,
+        "initial_regimes": dict.fromkeys(SECTORS, "TRANSITION"),
+        "records": [],
+    })
+    output = tmp_path / "formal_resume_out"
+    assert cli_main(inputs.args(output, "--from-scratch", as_of=monday)) == 0
+    before = output_bytes(output)
+
+    # Append a BACKFILL taking effect at monday (<= checkpoint last_processed_date)
+    write_json(inputs.regimes, {
+        "schema_version": "2.0.0",
+        "anchor_start_date": START,
+        "initial_regimes": dict.fromkeys(SECTORS, "TRANSITION"),
+        "records": [
+            {
+                "record_id": "RH-20261127-BF",
+                "decision_date": friday,
+                "effective_date": monday,
+                "symbol": GRID,
+                "prev_regime": "TRANSITION",
+                "new_regime": "RANGE_GRID",
+                "record_type": "BACKFILL",
+                "recorded_at": None,
+                "time_evidence_boundary": "post-hoc appended backfill",
+            }
+        ],
+    })
+    assert cli_main(inputs.args(output, as_of=tuesday)) == 2
+    assert "BACKFILL" in capsys.readouterr().err
+    assert output_bytes(output) == before
+
+
+def test_cli_valid_replay_init_then_formal_resume_with_null_forward_eval_start_date(tmp_path, capsys):
+    inputs = make_inputs(tmp_path)
+    cfg = json.loads(inputs.config.read_text(encoding="utf-8"))
+    cfg["backfill_replay_window"] = {"start_date": START, "end_date": "2026-11-26"}
+    cfg["forward_eval_start_date"] = None
+    write_json(inputs.config, cfg)
+
+    bf_rec = {
+        "record_id": "RH-BF-001",
+        "decision_date": inputs.dates[1],
+        "effective_date": inputs.dates[2],  # 2026-11-25, inside 2026-11-23..2026-11-26
+        "symbol": GRID,
+        "prev_regime": "TRANSITION",
+        "new_regime": "TRANSITION",
+        "record_type": "BACKFILL",
+        "recorded_at": None,
+        "time_evidence_boundary": "verified replay window backfill",
+    }
+    live_rec = {
+        "record_id": "RH-LIVE-001",
+        "decision_date": "2026-11-27",
+        "effective_date": "2026-11-30",
+        "symbol": GRID,
+        "prev_regime": "TRANSITION",
+        "new_regime": "RANGE_GRID",
+        "record_type": "LIVE",
+        "recorded_at": "2026-11-27T16:00:00+08:00",
+    }
+    attach_live_proof(tmp_path, live_rec, receipt_mtime=datetime(2026, 11, 27, 16, 0, tzinfo=CHINA_TZ))
+    payload = {
+        "schema_version": "2.0.0",
+        "anchor_start_date": START,
+        "initial_regimes": dict.fromkeys(SECTORS, "TRANSITION"),
+        "records": [bf_rec, live_rec],
+    }
+    write_json(inputs.regimes, payload)
+
+    output = tmp_path / "valid_resume_out"
+    assert cli_main(inputs.args(output, "--mode", "replay", "--from-scratch", as_of="2026-11-26")) == 0
+    assert cli_main(inputs.args(output, as_of=inputs.dates[-1])) == 0
+    state_a = load_state_json(output / "state.json")["accounts"]["A"]
+    assert state_a["symbol_states"][GRID]["active_regime"] == "RANGE_GRID"
+    assert state_a["positions"][GRID]["shares"] > 0
+
+    # Tampering with the already-replayed BACKFILL record blocks subsequent formal call and keeps files byte-identical
+    before = output_bytes(output)
+    payload["records"][0]["new_regime"] = "RANGE_GRID"
+    payload["records"][1]["prev_regime"] = "RANGE_GRID"
+    attach_live_proof(tmp_path, payload["records"][1], receipt_mtime=datetime(2026, 11, 27, 16, 0, tzinfo=CHINA_TZ))
+    write_json(inputs.regimes, payload)
+    assert cli_main(inputs.args(output, as_of=inputs.dates[-1])) == 2
+    assert "BACKFILL" in capsys.readouterr().err
+    assert output_bytes(output) == before

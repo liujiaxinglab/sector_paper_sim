@@ -665,3 +665,95 @@ def test_backfill_init_then_formal_live_resume_and_late_live_rejection():
     )
     with pytest.raises(ValueError, match="market open"):
         SimulationEngine.from_state(late_bundle, saved_state, run_mode="formal").run()
+
+
+def test_formal_resume_rejects_appended_modified_or_out_of_window_backfill():
+    days = sessions(8)  # 2026-11-23..2026-12-02 (index 5 = 2026-11-30, index 6 = 2026-12-01)
+    day_fri = days[4]  # 2026-11-27
+    day_mon = days[5]  # 2026-11-30
+    day_tue = days[6]  # 2026-12-01
+
+    # 1. With forward_eval_start_date=None, formal runs to 2026-11-30 cleanly when no BACKFILL exists
+    clean_bundle = make_bundle(days, initial_routes={SECTOR: "TRANSITION"}, forward_eval_start_date=None)
+    formal = run_simulation(clean_bundle, end_date=day_mon, run_mode="formal")
+    clean_state = json.loads(json.dumps(formal.export_state(), allow_nan=False))
+
+    # Append a BACKFILL taking effect at <= checkpoint (effective_date=2026-11-30, outside 23..26 window)
+    tampered_bundle = make_bundle(
+        days,
+        initial_routes={SECTOR: "TRANSITION"},
+        forward_eval_start_date=None,
+        record_overrides={
+            SECTOR: [
+                {
+                    "record_id": "RH-BF-LATE",
+                    "decision_date": day_fri,
+                    "effective_date": day_mon,
+                    "prev_regime": "TRANSITION",
+                    "regime": "RANGE_GRID",
+                    "record_type": "BACKFILL",
+                    "recorded_at": None,
+                    "time_evidence_boundary": "post-checkpoint backfill",
+                }
+            ]
+        },
+    )
+    with pytest.raises(ValueError, match="BACKFILL"):
+        SimulationEngine.from_state(tampered_bundle, clean_state, run_mode="formal").run(end_date=day_tue)
+    with pytest.raises(ValueError, match="BACKFILL"):
+        SimulationEngine.from_state(tampered_bundle, clean_state, run_mode="formal").step_day(day_tue)
+
+    # Even if replay ran past backfill_replay_window, formal mode rejects out-of-window BACKFILL
+    late_replay = run_simulation(tampered_bundle, end_date=day_mon, run_mode="replay")
+    late_state = json.loads(json.dumps(late_replay.export_state(), allow_nan=False))
+    with pytest.raises(ValueError, match="超出初始化回放区间"):
+        SimulationEngine.from_state(tampered_bundle, late_state, run_mode="formal").run(end_date=day_tue)
+
+    # 2. Valid replay in window (2026-11-23..2026-11-26) -> formal resume with forward_eval_start_date=None succeeds,
+    #    but modifying the replayed BACKFILL afterward breaks the checkpoint digest gate.
+    in_window_bundle = make_bundle(
+        days,
+        initial_routes={SECTOR: "TRANSITION"},
+        forward_eval_start_date=None,
+        record_overrides={
+            SECTOR: [
+                {
+                    "record_id": "RH-BF-INIT",
+                    "decision_date": days[0],
+                    "effective_date": days[1],
+                    "prev_regime": "TRANSITION",
+                    "regime": "TRANSITION",
+                    "record_type": "BACKFILL",
+                    "recorded_at": None,
+                    "time_evidence_boundary": "in-window init backfill",
+                }
+            ]
+        },
+    )
+    init_engine = run_simulation(in_window_bundle, end_date=days[3], run_mode="replay")  # through 2026-11-26
+    init_state = json.loads(json.dumps(init_engine.export_state(), allow_nan=False))
+    resumed = SimulationEngine.from_state(in_window_bundle, init_state, run_mode="formal")
+    summary = resumed.run(end_date=day_tue)
+    assert summary["last_processed_date"] == day_tue
+
+    modified_bundle = make_bundle(
+        days,
+        initial_routes={SECTOR: "TRANSITION"},
+        forward_eval_start_date=None,
+        record_overrides={
+            SECTOR: [
+                {
+                    "record_id": "RH-BF-INIT",
+                    "decision_date": days[0],
+                    "effective_date": days[1],
+                    "prev_regime": "TRANSITION",
+                    "regime": "RANGE_GRID",
+                    "record_type": "BACKFILL",
+                    "recorded_at": None,
+                    "time_evidence_boundary": "in-window init backfill",
+                }
+            ]
+        },
+    )
+    with pytest.raises(ValueError, match="不一致|BACKFILL"):
+        SimulationEngine.from_state(modified_bundle, init_state, run_mode="formal").run(end_date=day_tue)

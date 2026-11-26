@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+from datetime import date, datetime, timedelta, timezone
 import json
+import os
 from pathlib import Path
 import subprocess
 
@@ -10,10 +12,12 @@ import pandas as pd
 import pytest
 
 from src.data_loader import (
+    CHINA_TZ,
     DEFAULT_SIM_CONFIG_PATH,
     TDX_NUMERIC_COLUMNS,
     TDX_REQUIRED_COLUMNS,
     build_forward_adjusted_daily,
+    compute_regime_decision_sha256,
     find_latest_tdx_csv,
     load_corporate_actions_ledger,
     load_market_bundle,
@@ -351,36 +355,72 @@ def test_real_512480_split_adjustment_comes_from_the_ledger() -> None:
     assert adjusted.loc["2026-07-03", "adj_factor"] == pytest.approx(1.0)
 
 
+def _attach_live_proof(
+    journal_dir: Path,
+    record: dict,
+    *,
+    receipt_mtime: datetime | None = None,
+) -> Path:
+    recorded_cst = datetime.fromisoformat(record["recorded_at"].replace("Z", "+00:00")).astimezone(CHINA_TZ).isoformat()
+    decision_sha = compute_regime_decision_sha256(record, recorded_cst)
+    rel_path = f"pre_market_proofs/{record['record_id']}.json"
+    receipt_path = journal_dir / rel_path
+    receipt_path.parent.mkdir(parents=True, exist_ok=True)
+    receipt = {
+        "schema_version": "1.0.0",
+        "record_id": record["record_id"],
+        "decision_date": record["decision_date"],
+        "effective_date": record["effective_date"],
+        "symbol": record["symbol"],
+        "prev_regime": record["prev_regime"],
+        "new_regime": record["new_regime"],
+        "record_type": "LIVE",
+        "recorded_at": record["recorded_at"],
+        "recorded_at_cst": recorded_cst,
+        "decision_sha256": decision_sha,
+    }
+    _write_json(receipt_path, receipt)
+    if receipt_mtime is not None:
+        ts = receipt_mtime.timestamp()
+        os.utime(receipt_path, (ts, ts))
+    record["pre_market_proof"] = {
+        "receipt_path": rel_path,
+        "decision_sha256": decision_sha,
+    }
+    return receipt_path
+
+
 def test_regime_history_uses_effective_date_and_maps_unrated(tmp_path: Path) -> None:
     history_path = tmp_path / "regime_history.json"
+    rec_a = {
+        "record_id": "RH-20261125-001",
+        "decision_date": "2026-11-25",
+        "effective_date": "2026-11-26",
+        "symbol": "512400.SH",
+        "prev_regime": "TREND_UP",
+        "new_regime": "RANGE_GRID",
+        "record_type": "LIVE",
+        "recorded_at": "2026-11-25T16:00:00+08:00",
+    }
+    rec_b = {
+        "record_id": "RH-20261123-001",
+        "decision_date": "2026-11-23",
+        "effective_date": "2026-11-24",
+        "symbol": "512400.SH",
+        "prev_regime": "TRANSITION",
+        "new_regime": "TREND_UP",
+        "record_type": "LIVE",
+        "recorded_at": "2026-11-23T16:00:00+08:00",
+    }
+    _attach_live_proof(tmp_path, rec_a, receipt_mtime=datetime(2026, 11, 25, 16, 0, tzinfo=CHINA_TZ))
+    _attach_live_proof(tmp_path, rec_b, receipt_mtime=datetime(2026, 11, 23, 16, 0, tzinfo=CHINA_TZ))
     _write_json(
         history_path,
         {
             "schema_version": "2.0.0",
             "anchor_start_date": "2026-11-23",
             "initial_regimes": {"512400.SH": "UNRATED"},
-            "records": [
-                {
-                    "record_id": "RH-20261125-001",
-                    "decision_date": "2026-11-25",
-                    "effective_date": "2026-11-26",
-                    "symbol": "512400.SH",
-                    "prev_regime": "TREND_UP",
-                    "new_regime": "RANGE_GRID",
-                    "record_type": "LIVE",
-                    "recorded_at": "2026-11-25T16:00:00+08:00",
-                },
-                {
-                    "record_id": "RH-20261123-001",
-                    "decision_date": "2026-11-23",
-                    "effective_date": "2026-11-24",
-                    "symbol": "512400.SH",
-                    "prev_regime": "TRANSITION",
-                    "new_regime": "TREND_UP",
-                    "record_type": "LIVE",
-                    "recorded_at": "2026-11-23T16:00:00+08:00",
-                },
-            ],
+            "records": [rec_a, rec_b],
         },
     )
     history = load_regime_history(history_path, trading_calendar=ISO_DAYS)
@@ -411,6 +451,9 @@ def test_regime_history_enforces_bs01_t1_and_live_backfill_timestamps(tmp_path: 
             }
         ],
     }
+    pre_open_mtime = datetime(2026, 11, 30, 9, 29, 59, tzinfo=CHINA_TZ)
+    receipt_path = _attach_live_proof(tmp_path, base["records"][0], receipt_mtime=pre_open_mtime)
+    original_receipt_text = receipt_path.read_text(encoding="utf-8")
     history_path = tmp_path / "regime_history.json"
     _write_json(history_path, base)
     loaded = load_regime_history(history_path, trading_calendar=calendar)
@@ -429,9 +472,16 @@ def test_regime_history_enforces_bs01_t1_and_live_backfill_timestamps(tmp_path: 
         (lambda d: d["records"][0].__setitem__("record_type", "OTHER"), "record_type"),
         (lambda d: d["records"][0].__setitem__("recorded_at", None), "recorded_at"),
         (lambda d: d["records"][0].__setitem__("recorded_at", "2026-11-27T16:00:00"), "ISO 8601"),
+        (lambda d: d["records"][0].__setitem__("recorded_at", "2026-11-27T16:00:00+07:60"), "ISO 8601"),
+        (lambda d: d["records"][0].__setitem__("recorded_at", "2026-11-27T16:00:00+24:00"), "ISO 8601"),
+        (lambda d: d["records"][0].__setitem__("recorded_at", "2026-11-27T16:00:00-00:00"), "'-00:00'"),
         (lambda d: d["records"][0].__setitem__("recorded_at", "2026-11-26T23:59:59+08:00"), "precedes decision_date"),
         (lambda d: d["records"][0].__setitem__("recorded_at", "2026-11-30T09:30:00+08:00"), "market open"),
         (lambda d: d["records"][0].__setitem__("recorded_at", "2026-11-30T01:30:00Z"), "market open"),
+        (lambda d: d["records"][0].pop("pre_market_proof"), "pre_market_proof"),
+        (lambda d: d["records"][0]["pre_market_proof"].__setitem__("decision_sha256", "0" * 64), "does not match"),
+        (lambda d: d["records"][0]["pre_market_proof"].__setitem__("receipt_path", "pre_market_proofs/MISSING.json"), "Missing LIVE pre_market_proof"),
+        (lambda d: d["records"][0].__setitem__("new_regime", "TREND_UP"), "does not match"),
     ]:
         bad = json.loads(json.dumps(base))
         bad_mut(bad)
@@ -439,10 +489,20 @@ def test_regime_history_enforces_bs01_t1_and_live_backfill_timestamps(tmp_path: 
         with pytest.raises(ValueError, match=pattern):
             load_regime_history(history_path, trading_calendar=calendar)
 
+    # Post-market write with backfilled pre-market recorded_at must fail
+    _write_json(history_path, base)
+    for bad_ts in (datetime(2026, 11, 30, 9, 30, 0, tzinfo=CHINA_TZ), datetime(2026, 11, 30, 20, 48, 0, tzinfo=CHINA_TZ)):
+        os.utime(receipt_path, (bad_ts.timestamp(), bad_ts.timestamp()))
+        with pytest.raises(ValueError, match="market open"):
+            load_regime_history(history_path, trading_calendar=calendar)
+    receipt_path.write_text(original_receipt_text, encoding="utf-8")
+    os.utime(receipt_path, (pre_open_mtime.timestamp(), pre_open_mtime.timestamp()))
+
     # BACKFILL requires time_evidence_boundary when recorded_at is null
     backfill = json.loads(json.dumps(base))
     backfill["records"][0]["record_type"] = "BACKFILL"
     backfill["records"][0]["recorded_at"] = None
+    backfill["records"][0].pop("pre_market_proof", None)
     _write_json(history_path, backfill)
     with pytest.raises(ValueError, match="time_evidence_boundary"):
         load_regime_history(history_path, trading_calendar=calendar)
@@ -452,6 +512,74 @@ def test_regime_history_enforces_bs01_t1_and_live_backfill_timestamps(tmp_path: 
     with pytest.raises(ValueError, match="BACKFILL"):
         bf_loaded.validate_for_run_mode("formal", ["2026-11-27", "2026-11-30"])
     bf_loaded.validate_for_run_mode("replay", ["2026-11-27", "2026-11-30"])
+
+
+def test_regime_history_verifies_git_pre_market_commit_and_blocks_post_market_commit(tmp_path: Path) -> None:
+    repo = tmp_path / "radar_git"
+    journal = repo / "project_content" / "journal"
+    journal.mkdir(parents=True)
+    record = {
+        "record_id": "RH-20261123-001",
+        "decision_date": "2026-11-23",
+        "effective_date": "2026-11-24",
+        "symbol": "510720.SH",
+        "prev_regime": "TRANSITION",
+        "new_regime": "RANGE_GRID",
+        "record_type": "LIVE",
+        "recorded_at": "2026-11-23T16:00:00+08:00",
+        "decision_ref": "2026_decisions.md#2026-11-23-510720.SH",
+    }
+    decisions = journal / "2026_decisions.md"
+    decisions.write_text('<a id="2026-11-23-510720.SH"></a>\n\n### 510720.SH\n- RANGE_GRID\n', encoding="utf-8")
+    receipt_path = _attach_live_proof(journal, record, receipt_mtime=datetime(2026, 11, 23, 16, 0, tzinfo=CHINA_TZ))
+    import hashlib
+    from src.data_loader import _extract_decision_entry_block
+
+    block = _extract_decision_entry_block(decisions.read_text(encoding="utf-8"), "2026-11-23-510720.SH")
+    assert block is not None
+    receipt_payload = json.loads(receipt_path.read_text(encoding="utf-8"))
+    receipt_payload["decision_entry_sha256"] = hashlib.sha256(block.encode("utf-8")).hexdigest()
+    _write_json(receipt_path, receipt_payload)
+
+    history_path = journal / "regime_history.json"
+    _write_json(
+        history_path,
+        {
+            "schema_version": "2.0.0",
+            "anchor_start_date": "2026-11-23",
+            "initial_regimes": {"510720.SH": "TRANSITION"},
+            "records": [record],
+        },
+    )
+
+    def _git(args: list[str], commit_ts: str | None = None) -> None:
+        env = {**os.environ}
+        if commit_ts:
+            env["GIT_AUTHOR_DATE"] = commit_ts
+            env["GIT_COMMITTER_DATE"] = commit_ts
+        proc = subprocess.run(["git", "-C", str(repo), *args], env=env, capture_output=True, text=True, check=False)
+        assert proc.returncode == 0, proc.stderr
+
+    _git(["init"])
+    _git(["config", "user.name", "Tester"])
+    _git(["config", "user.email", "tester@example.com"])
+    _git(["add", "."])
+    _git(["commit", "-m", "pre-market freeze"], commit_ts="2026-11-23T16:05:00+08:00")
+
+    # Even with post-market file mtime, clean pre-market Git commit is accepted
+    post_ts = datetime(2026, 11, 26, 20, 48, 0, tzinfo=CHINA_TZ).timestamp()
+    os.utime(receipt_path, (post_ts, post_ts))
+    loaded = load_regime_history(history_path, trading_calendar=ISO_DAYS)
+    assert loaded.regime_for("510720.SH", "2026-11-24") == "RANGE_GRID"
+
+    # Re-committing receipt after market open must fail even if file mtime is spoofed pre-market
+    pre_ts = datetime(2026, 11, 23, 16, 0, 0, tzinfo=CHINA_TZ).timestamp()
+    receipt_path.write_text(receipt_path.read_text(encoding="utf-8") + " ", encoding="utf-8")
+    _git(["add", "."])
+    _git(["commit", "-m", "late commit"], commit_ts="2026-11-26T20:48:00+08:00")
+    os.utime(receipt_path, (pre_ts, pre_ts))
+    with pytest.raises(ValueError, match="Git commit timestamp"):
+        load_regime_history(history_path, trading_calendar=ISO_DAYS)
 
 
 def test_tdx_latest_batch_deduplicates_and_validates_dates(tmp_path: Path) -> None:

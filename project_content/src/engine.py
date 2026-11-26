@@ -10,8 +10,10 @@ from typing import Any, Mapping, Sequence
 
 from src.data_loader import (
     MarketBundle,
+    SHA256_PATTERN,
     assess_corporate_actions_gate,
     build_forward_adjusted_daily,
+    compute_backfill_digest,
 )
 from src.strategies import (
     GridConfig,
@@ -206,8 +208,33 @@ class SimulationEngine:
         self.last_processed_date: str | None = None
         self.trading_days_processed = 0
         self.daily_results: list[dict[str, Any]] = []
+        self._has_checkpoint_state = False
+        self._verified_backfill_through_date: str | None = None
+        self._verified_backfill_count = 0
+        self._verified_backfill_digest = compute_backfill_digest([])
         if initial_state is not None:
             self._load_state(initial_state)
+
+    def _routing_checkpoint(self) -> dict[str, Any] | None:
+        if (
+            self._verified_backfill_through_date is None
+            and self._verified_backfill_count == 0
+            and self._verified_backfill_digest is None
+        ):
+            return None
+        return {
+            "verified_backfill_through_date": self._verified_backfill_through_date,
+            "verified_backfill_count": self._verified_backfill_count,
+            "verified_backfill_digest": self._verified_backfill_digest,
+        }
+
+    def _refresh_replay_checkpoint(self) -> None:
+        if self.run_mode != "replay" or self.last_processed_date is None:
+            return
+        bf_records = self.bundle.regime_history.backfill_records_through(self.last_processed_date)
+        self._verified_backfill_through_date = self.last_processed_date
+        self._verified_backfill_count = len(bf_records)
+        self._verified_backfill_digest = compute_backfill_digest(bf_records)
 
     def _fresh_account(self, account_id: str, symbols: Sequence[str]) -> AccountState:
         return AccountState(
@@ -266,6 +293,32 @@ class SimulationEngine:
             for symbol, strategy in saved["symbol_states"].items():
                 account.symbol_states[symbol] = SymbolStrategyState.from_dict(strategy)
 
+        self._has_checkpoint_state = True
+        routing_cp = state.get("routing_checkpoint")
+        if routing_cp is None:
+            self._verified_backfill_through_date = None
+            self._verified_backfill_count = 0
+            self._verified_backfill_digest = None
+        else:
+            if not isinstance(routing_cp, Mapping):
+                raise ValueError("Invalid checkpoint routing_checkpoint: expected JSON object")
+            verified_through = routing_cp.get("verified_backfill_through_date")
+            verified_count = routing_cp.get("verified_backfill_count")
+            verified_digest = routing_cp.get("verified_backfill_digest")
+            if verified_through is not None:
+                if not isinstance(verified_through, str):
+                    raise ValueError("Invalid checkpoint verified_backfill_through_date")
+                verified_through = date.fromisoformat(verified_through).isoformat()
+                if last_date is not None and verified_through > last_date:
+                    raise ValueError("Checkpoint verified_backfill_through_date exceeds last_processed_date")
+            if type(verified_count) is not int or verified_count < 0:
+                raise ValueError("Invalid checkpoint verified_backfill_count")
+            if not isinstance(verified_digest, str) or not SHA256_PATTERN.fullmatch(verified_digest):
+                raise ValueError("Invalid checkpoint verified_backfill_digest")
+            self._verified_backfill_through_date = verified_through
+            self._verified_backfill_count = verified_count
+            self._verified_backfill_digest = verified_digest
+
     def export_state(self) -> dict[str, Any]:
         """Return only the closing balances, order books and pending open actions."""
         return {
@@ -273,6 +326,7 @@ class SimulationEngine:
             "start_date": self.start_date,
             "last_processed_date": self.last_processed_date,
             "last_known_closes": dict(sorted(self.last_known_closes.items())),
+            "routing_checkpoint": self._routing_checkpoint(),
             "accounts": {account_id: account.to_dict() for account_id, account in self.accounts.items()},
         }
 
@@ -572,7 +626,13 @@ class SimulationEngine:
             details = "; ".join(gate["reasons"])
             raise ValueError(f"Corporate-actions formal-run gate blocked {trade_date}: {details}")
         self.bundle.regime_history.validate_for_run_mode(
-            self.run_mode, [trade_date], forward_eval_start_date=self.forward_eval_start_date
+            self.run_mode,
+            [trade_date],
+            forward_eval_start_date=self.forward_eval_start_date,
+            last_processed_date=self.last_processed_date,
+            backfill_replay_window=self.bundle.config.get("backfill_replay_window"),
+            routing_checkpoint=self._routing_checkpoint(),
+            has_checkpoint_state=self._has_checkpoint_state,
         )
 
         targets = {}
@@ -611,6 +671,7 @@ class SimulationEngine:
         }
         self.last_processed_date = trade_date
         self.trading_days_processed += 1
+        self._refresh_replay_checkpoint()
         missing = [symbol for symbol, bar in bars.items() if bar is None]
         lagged = [symbol for symbol in missing if trade_date > self._bar_dates[symbol][-1]]
         effective_route_records = self.bundle.regime_history.records_effective_on(trade_date)
@@ -637,7 +698,13 @@ class SimulationEngine:
         end = end_date or self._trading_dates[-1]
         dates = [day for day in self._trading_dates[self.trading_days_processed:] if day <= end]
         self.bundle.regime_history.validate_for_run_mode(
-            self.run_mode, dates, forward_eval_start_date=self.forward_eval_start_date
+            self.run_mode,
+            dates,
+            forward_eval_start_date=self.forward_eval_start_date,
+            last_processed_date=self.last_processed_date,
+            backfill_replay_window=self.bundle.config.get("backfill_replay_window"),
+            routing_checkpoint=self._routing_checkpoint(),
+            has_checkpoint_state=self._has_checkpoint_state,
         )
         if dates:
             gate = assess_corporate_actions_gate(
