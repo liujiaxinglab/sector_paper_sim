@@ -472,6 +472,16 @@ def load_corporate_actions_ledger(
                         raise ValueError(
                             f"{symbol} {event_kind}[{idx}] VERIFIED event has invalid source_pdf_sha256"
                         )
+                elif source_pdf is not None or source_hash is not None:
+                    if (
+                        not isinstance(source_pdf, str) or not source_pdf.strip()
+                        or not isinstance(source_hash, str)
+                        or not SHA256_PATTERN.fullmatch(source_hash)
+                    ):
+                        raise ValueError(
+                            f"{symbol} {event_kind}[{idx}] PROVISIONAL event source_pdf and "
+                            "source_pdf_sha256 must both be null or both contain valid values"
+                        )
                 event = {
                     **dict(raw_event),
                     "symbol": symbol,

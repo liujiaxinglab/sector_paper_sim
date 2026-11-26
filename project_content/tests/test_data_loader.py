@@ -304,6 +304,24 @@ def test_provisional_actions_are_retained_but_never_applied(tmp_path: Path) -> N
     assert "缺少官方 PDF" in pending[0]["evidence_gap"]
 
 
+def test_provisional_pdf_and_hash_must_be_both_null_or_a_valid_pair(tmp_path: Path) -> None:
+    config = _make_synthetic_config(
+        tmp_path,
+        {"159330.SZ": ISO_DAYS, "512400.SH": ISO_DAYS},
+    )
+    ledger_path = Path(config["upstream_paths"]["corporate_actions_ledger_file"])
+    payload = json.loads(ledger_path.read_text(encoding="utf-8"))
+    payload["splits_by_symbol"]["512400.SH"] = [{
+        "effective_date": "2026-11-25", "factor": 0.5,
+        "source_class": "PROVISIONAL_TEST", "event_status": "PROVISIONAL",
+        "source_pdf": "raw/test/split.pdf", "source_pdf_sha256": None,
+    }]
+    _write_json(ledger_path, payload)
+
+    with pytest.raises(ValueError, match="PROVISIONAL event source_pdf and source_pdf_sha256"):
+        load_corporate_actions_ledger(ledger_path)
+
+
 def test_shared_gate_blocks_lag_and_effective_provisional_events() -> None:
     future = [{"date": "2026-11-27", "symbol": "512400.SH", "event_status": "PROVISIONAL"}]
     assert assess_corporate_actions_gate("2026-11-26", "2026-11-26", future)["allowed"]
