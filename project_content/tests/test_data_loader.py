@@ -2,13 +2,22 @@
 
 from __future__ import annotations
 
+import base64
 from datetime import date, datetime, timedelta, timezone
+import hashlib
 import json
 import os
 from pathlib import Path
 import subprocess
 
+from cryptography import x509
+from cryptography.hazmat.primitives import hashes, serialization
+from cryptography.hazmat.primitives.asymmetric import ec
+from cryptography.x509.oid import ExtendedKeyUsageOID, NameOID
 import pandas as pd
+from pyasn1.codec.der import decoder as der_decoder, encoder as der_encoder
+from pyasn1.type import univ, useful
+from pyasn1_modules import rfc3161, rfc5280, rfc5652
 import pytest
 
 from src.data_loader import (
@@ -16,7 +25,9 @@ from src.data_loader import (
     DEFAULT_SIM_CONFIG_PATH,
     TDX_NUMERIC_COLUMNS,
     TDX_REQUIRED_COLUMNS,
+    RegimeHistory,
     build_forward_adjusted_daily,
+    compute_live_attestation_payload,
     compute_regime_decision_sha256,
     find_latest_tdx_csv,
     load_corporate_actions_ledger,
@@ -355,19 +366,148 @@ def test_real_512480_split_adjustment_comes_from_the_ledger() -> None:
     assert adjusted.loc["2026-07-03", "adj_factor"] == pytest.approx(1.0)
 
 
+class _TestTSA:
+    """Test-only offline RFC 3161 TSA issuer."""
+
+    def __init__(self, cn: str = "PaperSim Test TSA") -> None:
+        base_time = datetime(2026, 1, 1, 0, 0, 0, tzinfo=timezone.utc)
+        self.root_key = ec.generate_private_key(ec.SECP256R1())
+        self.tsa_key = ec.generate_private_key(ec.SECP256R1())
+        root_name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, f"{cn} Root")])
+        tsa_name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, f"{cn} Signer")])
+        self.root_cert = (
+            x509.CertificateBuilder()
+            .subject_name(root_name).issuer_name(root_name)
+            .public_key(self.root_key.public_key())
+            .serial_number(x509.random_serial_number())
+            .not_valid_before(base_time)
+            .not_valid_after(base_time + timedelta(days=3650))
+            .add_extension(x509.BasicConstraints(ca=True, path_length=None), critical=True)
+            .add_extension(
+                x509.KeyUsage(
+                    digital_signature=False, content_commitment=False, key_encipherment=False,
+                    data_encipherment=False, key_agreement=False, key_cert_sign=True,
+                    crl_sign=True, encipher_only=False, decipher_only=False,
+                ),
+                critical=True,
+            )
+            .add_extension(x509.SubjectKeyIdentifier.from_public_key(self.root_key.public_key()), critical=False)
+            .sign(self.root_key, hashes.SHA256())
+        )
+        self.tsa_cert = (
+            x509.CertificateBuilder()
+            .subject_name(tsa_name).issuer_name(root_name)
+            .public_key(self.tsa_key.public_key())
+            .serial_number(x509.random_serial_number())
+            .not_valid_before(base_time)
+            .not_valid_after(base_time + timedelta(days=3650))
+            .add_extension(x509.BasicConstraints(ca=False, path_length=None), critical=True)
+            .add_extension(
+                x509.KeyUsage(
+                    digital_signature=True, content_commitment=True, key_encipherment=False,
+                    data_encipherment=False, key_agreement=False, key_cert_sign=False,
+                    crl_sign=False, encipher_only=False, decipher_only=False,
+                ),
+                critical=True,
+            )
+            .add_extension(x509.ExtendedKeyUsage([ExtendedKeyUsageOID.TIME_STAMPING]), critical=True)
+            .add_extension(x509.SubjectKeyIdentifier.from_public_key(self.tsa_key.public_key()), critical=False)
+            .add_extension(
+                x509.AuthorityKeyIdentifier.from_issuer_subject_key_identifier(
+                    self.root_cert.extensions.get_extension_for_class(x509.SubjectKeyIdentifier).value
+                ),
+                critical=False,
+            )
+            .sign(self.root_key, hashes.SHA256())
+        )
+
+    def sign_digest(self, digest_bytes: bytes, gen_time: datetime) -> bytes:
+        gen_utc = gen_time.astimezone(timezone.utc)
+        tst = rfc3161.TSTInfo()
+        tst["version"] = 1
+        tst["policy"] = univ.ObjectIdentifier("1.2.3.4.5")
+        tst["messageImprint"]["hashAlgorithm"]["algorithm"] = univ.ObjectIdentifier("2.16.840.1.101.3.4.2.1")
+        tst["messageImprint"]["hashAlgorithm"]["parameters"] = univ.Null("")
+        tst["messageImprint"]["hashedMessage"] = digest_bytes
+        tst["serialNumber"] = 1
+        tst["genTime"] = useful.GeneralizedTime(gen_utc.strftime("%Y%m%d%H%M%SZ"))
+        e_content = der_encoder.encode(tst)
+
+        sa_set = rfc5652.SignedAttributes()
+        a1 = rfc5652.Attribute()
+        a1["attrType"] = rfc5652.id_contentType
+        a1["attrValues"][0] = der_encoder.encode(univ.ObjectIdentifier("1.2.840.113549.1.9.16.1.4"))
+        a2 = rfc5652.Attribute()
+        a2["attrType"] = rfc5652.id_messageDigest
+        a2["attrValues"][0] = der_encoder.encode(univ.OctetString(hashlib.sha256(e_content).digest()))
+        sa_set[0] = a1
+        sa_set[1] = a2
+        sig = self.tsa_key.sign(der_encoder.encode(sa_set), ec.ECDSA(hashes.SHA256()))
+
+        sd = rfc5652.SignedData()
+        sd["version"] = 3
+        da = rfc5652.DigestAlgorithmIdentifier()
+        da["algorithm"] = univ.ObjectIdentifier("2.16.840.1.101.3.4.2.1")
+        da["parameters"] = univ.Null("")
+        sd["digestAlgorithms"][0] = da
+        sd["encapContentInfo"]["eContentType"] = univ.ObjectIdentifier("1.2.840.113549.1.9.16.1.4")
+        sd["encapContentInfo"]["eContent"] = e_content
+        cert_choice = rfc5652.CertificateChoices()
+        parsed_cert, _ = der_decoder.decode(
+            self.tsa_cert.public_bytes(serialization.Encoding.DER), asn1Spec=rfc5280.Certificate()
+        )
+        cert_choice["certificate"] = parsed_cert
+        sd["certificates"][0] = cert_choice
+
+        si = rfc5652.SignerInfo()
+        si["version"] = 1
+        issuer_asn1, _ = der_decoder.decode(self.tsa_cert.issuer.public_bytes(), asn1Spec=rfc5280.Name())
+        si["sid"]["issuerAndSerialNumber"]["issuer"] = issuer_asn1
+        si["sid"]["issuerAndSerialNumber"]["serialNumber"] = self.tsa_cert.serial_number
+        si["digestAlgorithm"] = da
+        si["signedAttrs"][0] = a1
+        si["signedAttrs"][1] = a2
+        si["signatureAlgorithm"]["algorithm"] = univ.ObjectIdentifier("1.2.840.10045.4.3.2")
+        si["signature"] = sig
+        sd["signerInfos"][0] = si
+
+        ci = rfc5652.ContentInfo()
+        ci["contentType"] = rfc5652.id_signedData
+        ci["content"] = der_encoder.encode(sd)
+        resp = rfc3161.TimeStampResp()
+        resp["status"]["status"] = 0
+        resp["timeStampToken"] = ci
+        return der_encoder.encode(resp)
+
+
 def _attach_live_proof(
     journal_dir: Path,
     record: dict,
     *,
-    receipt_mtime: datetime | None = None,
+    tsa: _TestTSA | None = None,
+    gen_time: datetime | None = None,
+    entry_sha256: str | None = None,
 ) -> Path:
     recorded_cst = datetime.fromisoformat(record["recorded_at"].replace("Z", "+00:00")).astimezone(CHINA_TZ).isoformat()
     decision_sha = compute_regime_decision_sha256(record, recorded_cst)
     rel_path = f"pre_market_proofs/{record['record_id']}.json"
     receipt_path = journal_dir / rel_path
     receipt_path.parent.mkdir(parents=True, exist_ok=True)
+    attestation_bytes = compute_live_attestation_payload(
+        record_id=record["record_id"],
+        decision_date=record["decision_date"],
+        effective_date=record["effective_date"],
+        symbol=record["symbol"],
+        prev_regime=record["prev_regime"],
+        new_regime=record["new_regime"],
+        recorded_at_cst=recorded_cst,
+        decision_sha256=decision_sha,
+        decision_entry_sha256=entry_sha256,
+        decision_ref=record.get("decision_ref"),
+        card_path=record.get("card_path"),
+    )
     receipt = {
-        "schema_version": "1.0.0",
+        "schema_version": "2.0.0",
         "record_id": record["record_id"],
         "decision_date": record["decision_date"],
         "effective_date": record["effective_date"],
@@ -378,19 +518,29 @@ def _attach_live_proof(
         "recorded_at": record["recorded_at"],
         "recorded_at_cst": recorded_cst,
         "decision_sha256": decision_sha,
+        "decision_entry_sha256": entry_sha256,
+        "attestation_sha256": hashlib.sha256(attestation_bytes).hexdigest(),
     }
     _write_json(receipt_path, receipt)
-    if receipt_mtime is not None:
-        ts = receipt_mtime.timestamp()
-        os.utime(receipt_path, (ts, ts))
-    record["pre_market_proof"] = {
+    proof: dict = {
         "receipt_path": rel_path,
         "decision_sha256": decision_sha,
+        "decision_entry_sha256": entry_sha256,
     }
+    if tsa is not None:
+        ts_dt = gen_time if gen_time is not None else datetime.fromisoformat(recorded_cst)
+        tsr_bytes = tsa.sign_digest(hashlib.sha256(attestation_bytes).digest(), ts_dt)
+        tsr_rel = f"pre_market_proofs/{record['record_id']}.tsr"
+        (journal_dir / tsr_rel).write_bytes(tsr_bytes)
+        proof["tsa_token_path"] = tsr_rel
+        proof["tsa_token_b64"] = base64.b64encode(tsr_bytes).decode("ascii")
+    record["pre_market_proof"] = proof
     return receipt_path
 
 
-def test_regime_history_uses_effective_date_and_maps_unrated(tmp_path: Path) -> None:
+def test_regime_history_uses_effective_date_and_maps_unrated(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    tsa = _TestTSA()
+    monkeypatch.setattr("src.data_loader._load_default_trusted_tsa_roots", lambda: (tsa.root_cert,))
     history_path = tmp_path / "regime_history.json"
     rec_a = {
         "record_id": "RH-20261125-001",
@@ -412,8 +562,8 @@ def test_regime_history_uses_effective_date_and_maps_unrated(tmp_path: Path) -> 
         "record_type": "LIVE",
         "recorded_at": "2026-11-23T16:00:00+08:00",
     }
-    _attach_live_proof(tmp_path, rec_a, receipt_mtime=datetime(2026, 11, 25, 16, 0, tzinfo=CHINA_TZ))
-    _attach_live_proof(tmp_path, rec_b, receipt_mtime=datetime(2026, 11, 23, 16, 0, tzinfo=CHINA_TZ))
+    _attach_live_proof(tmp_path, rec_a, tsa=tsa, gen_time=datetime(2026, 11, 25, 16, 0, tzinfo=CHINA_TZ))
+    _attach_live_proof(tmp_path, rec_b, tsa=tsa, gen_time=datetime(2026, 11, 23, 16, 0, tzinfo=CHINA_TZ))
     _write_json(
         history_path,
         {
@@ -432,7 +582,12 @@ def test_regime_history_uses_effective_date_and_maps_unrated(tmp_path: Path) -> 
         history.regime_for("512400.SH", "2026-11-22")
 
 
-def test_regime_history_enforces_bs01_t1_and_live_backfill_timestamps(tmp_path: Path) -> None:
+def test_regime_history_enforces_bs01_t1_and_live_backfill_timestamps(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    tsa = _TestTSA("Trusted Sim TSA")
+    untrusted_tsa = _TestTSA("Untrusted Sim TSA")
+    monkeypatch.setattr("src.data_loader._load_default_trusted_tsa_roots", lambda: (tsa.root_cert,))
     calendar = ["2026-11-26", "2026-11-27", "2026-11-30", "2026-12-01"]
     base = {
         "schema_version": "2.0.0",
@@ -451,14 +606,21 @@ def test_regime_history_enforces_bs01_t1_and_live_backfill_timestamps(tmp_path: 
             }
         ],
     }
-    pre_open_mtime = datetime(2026, 11, 30, 9, 29, 59, tzinfo=CHINA_TZ)
-    receipt_path = _attach_live_proof(tmp_path, base["records"][0], receipt_mtime=pre_open_mtime)
-    original_receipt_text = receipt_path.read_text(encoding="utf-8")
+    pre_open_ts = datetime(2026, 11, 30, 9, 29, 59, tzinfo=CHINA_TZ)
+    receipt_path = _attach_live_proof(tmp_path, base["records"][0], tsa=tsa, gen_time=pre_open_ts)
+    tsr_path = tmp_path / "pre_market_proofs" / "RH-20261127-001.tsr"
+    attestation_digest = bytes.fromhex(json.loads(receipt_path.read_text(encoding="utf-8"))["attestation_sha256"])
     history_path = tmp_path / "regime_history.json"
     _write_json(history_path, base)
     loaded = load_regime_history(history_path, trading_calendar=calendar)
     assert loaded.regime_for("512400.SH", "2026-11-27") == "TRANSITION"
     assert loaded.regime_for("512400.SH", "2026-11-30") == "RANGE_GRID"
+
+    # Even with post-market file mtime (re-clone), valid pre-market TSA passes
+    post_mtime = datetime(2026, 11, 30, 20, 48, 0, tzinfo=CHINA_TZ).timestamp()
+    os.utime(receipt_path, (post_mtime, post_mtime))
+    os.utime(tsr_path, (post_mtime, post_mtime))
+    assert load_regime_history(history_path, trading_calendar=calendar).regime_for("512400.SH", "2026-11-30") == "RANGE_GRID"
 
     # Calendar +1 day (Saturday 2026-11-28) instead of BS-01 Monday 2026-11-30 must fail
     bad_weekend = json.loads(json.dumps(base))
@@ -479,6 +641,7 @@ def test_regime_history_enforces_bs01_t1_and_live_backfill_timestamps(tmp_path: 
         (lambda d: d["records"][0].__setitem__("recorded_at", "2026-11-30T09:30:00+08:00"), "market open"),
         (lambda d: d["records"][0].__setitem__("recorded_at", "2026-11-30T01:30:00Z"), "market open"),
         (lambda d: d["records"][0].pop("pre_market_proof"), "pre_market_proof"),
+        (lambda d: d["records"][0]["pre_market_proof"].pop("tsa_token_b64"), "tsa_token_b64"),
         (lambda d: d["records"][0]["pre_market_proof"].__setitem__("decision_sha256", "0" * 64), "does not match"),
         (lambda d: d["records"][0]["pre_market_proof"].__setitem__("receipt_path", "pre_market_proofs/MISSING.json"), "Missing LIVE pre_market_proof"),
         (lambda d: d["records"][0].__setitem__("new_regime", "TREND_UP"), "does not match"),
@@ -489,14 +652,28 @@ def test_regime_history_enforces_bs01_t1_and_live_backfill_timestamps(tmp_path: 
         with pytest.raises(ValueError, match=pattern):
             load_regime_history(history_path, trading_calendar=calendar)
 
-    # Post-market write with backfilled pre-market recorded_at must fail
-    _write_json(history_path, base)
+    # Untrusted CA TSA token with rolled-back mtime must fail
+    untrusted_data = json.loads(json.dumps(base))
+    untrusted_tsr = untrusted_tsa.sign_digest(attestation_digest, pre_open_ts)
+    tsr_path.write_bytes(untrusted_tsr)
+    untrusted_data["records"][0]["pre_market_proof"]["tsa_token_b64"] = base64.b64encode(untrusted_tsr).decode("ascii")
+    os.utime(receipt_path, (pre_open_ts.timestamp(), pre_open_ts.timestamp()))
+    os.utime(tsr_path, (pre_open_ts.timestamp(), pre_open_ts.timestamp()))
+    _write_json(history_path, untrusted_data)
+    with pytest.raises(ValueError, match="unverified source"):
+        load_regime_history(history_path, trading_calendar=calendar)
+
+    # Post-market TSA reception time (even with rolled-back pre-market mtime) must fail
     for bad_ts in (datetime(2026, 11, 30, 9, 30, 0, tzinfo=CHINA_TZ), datetime(2026, 11, 30, 20, 48, 0, tzinfo=CHINA_TZ)):
-        os.utime(receipt_path, (bad_ts.timestamp(), bad_ts.timestamp()))
+        late_tsr = tsa.sign_digest(attestation_digest, bad_ts)
+        tsr_path.write_bytes(late_tsr)
+        late_data = json.loads(json.dumps(base))
+        late_data["records"][0]["pre_market_proof"]["tsa_token_b64"] = base64.b64encode(late_tsr).decode("ascii")
+        os.utime(receipt_path, (pre_open_ts.timestamp(), pre_open_ts.timestamp()))
+        os.utime(tsr_path, (pre_open_ts.timestamp(), pre_open_ts.timestamp()))
+        _write_json(history_path, late_data)
         with pytest.raises(ValueError, match="market open"):
             load_regime_history(history_path, trading_calendar=calendar)
-    receipt_path.write_text(original_receipt_text, encoding="utf-8")
-    os.utime(receipt_path, (pre_open_mtime.timestamp(), pre_open_mtime.timestamp()))
 
     # BACKFILL requires time_evidence_boundary when recorded_at is null
     backfill = json.loads(json.dumps(base))
@@ -514,7 +691,12 @@ def test_regime_history_enforces_bs01_t1_and_live_backfill_timestamps(tmp_path: 
     bf_loaded.validate_for_run_mode("replay", ["2026-11-27", "2026-11-30"])
 
 
-def test_regime_history_verifies_git_pre_market_commit_and_blocks_post_market_commit(tmp_path: Path) -> None:
+def test_regime_history_rejects_backfilled_git_dates_and_in_memory_missing_proof(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from src.data_loader import _extract_decision_entry_block
+
+    tsa = _TestTSA("Trusted Git Test TSA")
     repo = tmp_path / "radar_git"
     journal = repo / "project_content" / "journal"
     journal.mkdir(parents=True)
@@ -531,16 +713,14 @@ def test_regime_history_verifies_git_pre_market_commit_and_blocks_post_market_co
     }
     decisions = journal / "2026_decisions.md"
     decisions.write_text('<a id="2026-11-23-510720.SH"></a>\n\n### 510720.SH\n- RANGE_GRID\n', encoding="utf-8")
-    receipt_path = _attach_live_proof(journal, record, receipt_mtime=datetime(2026, 11, 23, 16, 0, tzinfo=CHINA_TZ))
-    import hashlib
-    from src.data_loader import _extract_decision_entry_block
-
     block = _extract_decision_entry_block(decisions.read_text(encoding="utf-8"), "2026-11-23-510720.SH")
     assert block is not None
-    receipt_payload = json.loads(receipt_path.read_text(encoding="utf-8"))
-    receipt_payload["decision_entry_sha256"] = hashlib.sha256(block.encode("utf-8")).hexdigest()
-    _write_json(receipt_path, receipt_payload)
+    entry_sha = hashlib.sha256(block.encode("utf-8")).hexdigest()
 
+    # Unsigned receipt with backfilled st_mtime and backfilled local Git commit must fail
+    receipt_path = _attach_live_proof(journal, record, tsa=None, entry_sha256=entry_sha)
+    pre_ts = datetime(2026, 11, 23, 16, 0, 0, tzinfo=CHINA_TZ).timestamp()
+    os.utime(receipt_path, (pre_ts, pre_ts))
     history_path = journal / "regime_history.json"
     _write_json(
         history_path,
@@ -564,22 +744,72 @@ def test_regime_history_verifies_git_pre_market_commit_and_blocks_post_market_co
     _git(["config", "user.name", "Tester"])
     _git(["config", "user.email", "tester@example.com"])
     _git(["add", "."])
-    _git(["commit", "-m", "pre-market freeze"], commit_ts="2026-11-23T16:05:00+08:00")
+    _git(["commit", "-m", "backfilled pre-market git date"], commit_ts="2026-11-23T16:00:00+08:00")
+    with pytest.raises(ValueError, match="tsa_token_b64"):
+        load_regime_history(history_path, trading_calendar=ISO_DAYS)
 
-    # Even with post-market file mtime, clean pre-market Git commit is accepted
+    # Self-signed TSA token committed with pre-market Git dates must also fail under production roots
+    _attach_live_proof(
+        journal, record, tsa=tsa, gen_time=datetime(2026, 11, 23, 16, 5, 0, tzinfo=CHINA_TZ), entry_sha256=entry_sha
+    )
+    _write_json(
+        history_path,
+        {
+            "schema_version": "2.0.0",
+            "anchor_start_date": "2026-11-23",
+            "initial_regimes": {"510720.SH": "TRANSITION"},
+            "records": [record],
+        },
+    )
+    _git(["add", "."])
+    _git(["commit", "-m", "untrusted tsr"], commit_ts="2026-11-23T16:05:00+08:00")
+    with pytest.raises(ValueError, match="unverified source"):
+        load_regime_history(history_path, trading_calendar=ISO_DAYS)
+
+    # In-memory RegimeHistory (source_path=None) must NOT skip pre_market_proof verification
+    in_memory_unproven = RegimeHistory(
+        schema_version="2.0.0",
+        anchor_start_date="2026-11-23",
+        initial_regimes={"510720.SH": "TRANSITION"},
+        records_by_symbol={
+            "510720.SH": [
+                {
+                    "record_id": "RH-MEM-001",
+                    "decision_date": "2026-11-23",
+                    "effective_date": "2026-11-24",
+                    "prev_regime": "TRANSITION",
+                    "regime": "RANGE_GRID",
+                    "record_type": "LIVE",
+                    "recorded_at": "2026-11-23T16:00:00+08:00",
+                }
+            ]
+        },
+        source_path=None,
+    )
+    with pytest.raises(ValueError, match="pre_market_proof"):
+        in_memory_unproven.validate_for_run_mode("formal", ["2026-11-23", "2026-11-24"])
+
+    # When TSA root is trusted, valid pre-market proof passes on both disk (with post-market mtime) and in-memory
+    monkeypatch.setattr("src.data_loader._load_default_trusted_tsa_roots", lambda: (tsa.root_cert,))
     post_ts = datetime(2026, 11, 26, 20, 48, 0, tzinfo=CHINA_TZ).timestamp()
     os.utime(receipt_path, (post_ts, post_ts))
     loaded = load_regime_history(history_path, trading_calendar=ISO_DAYS)
     assert loaded.regime_for("510720.SH", "2026-11-24") == "RANGE_GRID"
-
-    # Re-committing receipt after market open must fail even if file mtime is spoofed pre-market
-    pre_ts = datetime(2026, 11, 23, 16, 0, 0, tzinfo=CHINA_TZ).timestamp()
-    receipt_path.write_text(receipt_path.read_text(encoding="utf-8") + " ", encoding="utf-8")
-    _git(["add", "."])
-    _git(["commit", "-m", "late commit"], commit_ts="2026-11-26T20:48:00+08:00")
-    os.utime(receipt_path, (pre_ts, pre_ts))
-    with pytest.raises(ValueError, match="Git commit timestamp"):
-        load_regime_history(history_path, trading_calendar=ISO_DAYS)
+    in_memory_valid = RegimeHistory(
+        schema_version="2.0.0",
+        anchor_start_date="2026-11-23",
+        initial_regimes={"510720.SH": "TRANSITION"},
+        records_by_symbol={
+            "510720.SH": [
+                {
+                    **record,
+                    "regime": "RANGE_GRID",
+                }
+            ]
+        },
+        source_path=None,
+    )
+    in_memory_valid.validate_for_run_mode("formal", ["2026-11-23", "2026-11-24"])
 
 
 def test_tdx_latest_batch_deduplicates_and_validates_dates(tmp_path: Path) -> None:
