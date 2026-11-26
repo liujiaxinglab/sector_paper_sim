@@ -59,7 +59,7 @@ python -m pytest -q
 
 ### 2.3 跨目录调用、测试与外部调度器边界
 
-- **非仓库 `cwd` 调用**：从任意外部目录通过脚本路径调用（例如 `python <工作区父目录>/sector_paper_sim/project_content/src/run_daily_sim.py --mode replay --as-of 2026-11-25 --dry-run`）时，内部默认配置、同级 `QuantData` / `sector_radar` 上游路径及默认输出目录仍精确锚定到所属仓库，不受 `cwd` 影响。
+- **非仓库 `cwd` 调用**：从任意外部目录通过脚本路径调用（例如 `python <工作区父目录>/sector_paper_sim/project_content/src/run_daily_sim.py --mode replay --from-scratch --as-of 2026-11-25 --dry-run`）时，内部默认配置、同级 `QuantData` / `sector_radar` 上游路径及默认输出目录仍精确锚定到所属仓库，不受 `cwd` 影响。
 - **跨目录测试**：[pyproject.toml](../../pyproject.toml) 已配置相对 `rootdir` 的 `pythonpath` 与 `testpaths`；从仓库外部目录测试时，可执行：
   ```powershell
   python -m pytest -q -c <工作区父目录>/sector_paper_sim/pyproject.toml --rootdir <工作区父目录>/sector_paper_sim <工作区父目录>/sector_paper_sim/project_content/tests
