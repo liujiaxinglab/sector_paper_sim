@@ -5,7 +5,6 @@ from __future__ import annotations
 import json
 from pathlib import Path
 import subprocess
-import sys
 
 import pandas as pd
 import pytest
@@ -394,13 +393,13 @@ def test_pytest_config_imports_package_from_an_external_working_directory(
     )
     probe_file.write_text(
         probe_file.read_text(encoding="utf-8")
-        + "    for module in ('src.engine', 'src.strategies', 'src.reporter', 'src.run_weekly_sim'):\n"
+        + "    for module in ('src.engine', 'src.strategies', 'src.reporter', 'src.run_daily_sim'):\n"
         + "        assert import_module(module)\n",
         encoding="utf-8",
     )
     result = subprocess.run(
         [
-            sys.executable,
+            "C:/Users/jxing/.conda/envs/quant/python.exe",
             "-m",
             "pytest",
             "-c",
