@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import csv
 from datetime import date
+import json
 from pathlib import Path
 import sys
 from typing import Any, Sequence
@@ -13,7 +14,13 @@ if not __package__:
     # Support invocation by absolute script path from any working directory.
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from src.data_loader import DEFAULT_SIM_CONFIG_PATH, MarketBundle, load_market_bundle, load_trade_calendar
+from src.data_loader import (
+    DEFAULT_SIM_CONFIG_PATH,
+    MarketBundle,
+    assess_corporate_actions_gate,
+    load_market_bundle,
+    load_trade_calendar,
+)
 from src.engine import ACCOUNT_IDS, ENGINE_SCHEMA_VERSION, SimulationEngine
 from src.reporter import (
     NAV_CSV_COLUMNS,
@@ -112,6 +119,25 @@ def run_daily_sim(
         bundle.config["upstream_paths"]["trade_calendar_dir"], start_date=start, end_date=cutoff
     )
 
+    corporate_actions_gate = assess_corporate_actions_gate(
+        bundle.metadata["corporate_actions_as_of"],
+        dates[-1],
+        bundle.metadata.get("unverified_corporate_action_events", []),
+    )
+    if not corporate_actions_gate["allowed"]:
+        if dry_run:
+            print(
+                "[DRY-RUN][BLOCKED] "
+                + json.dumps(corporate_actions_gate, ensure_ascii=False, sort_keys=True)
+            )
+            return {
+                "status": "BLOCKED",
+                "corporate_actions_gate": corporate_actions_gate,
+                "dry_run": True,
+            }
+        details = "; ".join(corporate_actions_gate["reasons"])
+        raise ValueError(f"公司行为台账门禁阻断正式运行: {details}")
+
     lag_warnings = _lag_warnings(bundle, dates[-1])
     for warning in lag_warnings:
         print(f"[行情滞后] {warning}", file=sys.stderr)
@@ -187,12 +213,14 @@ def build_arg_parser() -> argparse.ArgumentParser:
 def main(argv: Sequence[str] | None = None) -> int:
     args = build_arg_parser().parse_args(argv)
     try:
-        run_daily_sim(
+        outcome = run_daily_sim(
             config_path=args.config, output_dir=args.output_dir, as_of=args.as_of,
             from_scratch=args.from_scratch, allow_lag=args.allow_lag, dry_run=args.dry_run,
         )
     except (OSError, ValueError, TypeError, KeyError, RuntimeError, csv.Error) as exc:
         print(f"[运行失败] {exc}", file=sys.stderr)
+        return 2
+    if outcome.get("status") == "BLOCKED":
         return 2
     return 0
 

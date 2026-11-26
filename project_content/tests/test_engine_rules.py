@@ -525,6 +525,24 @@ def test_engine_rejects_skipping_calendar_days_and_warmup_orders():
     assert engine.last_processed_date is None
 
 
+def test_engine_blocks_effective_unverified_event_on_direct_step_and_run():
+    days = sessions(2)
+    bundle = make_bundle(days)
+    bundle.metadata["unverified_corporate_action_events"] = [{
+        "date": days[1], "symbol": SECTOR, "kind": "split",
+        "event_status": "PROVISIONAL", "evidence_gap": "missing official PDF",
+    }]
+    engine = SimulationEngine(bundle)
+    engine.step_day(days[0])
+    with pytest.raises(ValueError, match="1 个未 VERIFIED 公司行为"):
+        engine.step_day(days[1])
+
+    fresh = SimulationEngine(bundle)
+    with pytest.raises(ValueError, match="1 个未 VERIFIED 公司行为"):
+        fresh.run()
+    assert fresh.daily_results == []
+
+
 def test_invalid_ohlc_range_cannot_be_used_as_a_tradable_bar():
     bundle = make_bundle([START], bars={SECTOR: {START: (1.0, 1.01, 0.99, 1.02)}})
     with pytest.raises(ValueError, match="Invalid OHLC range"):

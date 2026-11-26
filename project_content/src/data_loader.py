@@ -25,6 +25,7 @@ DEFAULT_SIM_CONFIG_PATH = REPO_ROOT / "project_content" / "config" / "sim_config
 TDX_BATCH_CSV_PATTERN = re.compile(r"^\d{8}_\d{6}\.csv$")
 TRADE_CALENDAR_CSV_PATTERN = re.compile(r"^\d{8}_\d{6}\.csv$")
 ISO_DATE_PATTERN = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+SHA256_PATTERN = re.compile(r"^[0-9a-f]{64}$")
 CORPORATE_ACTIONS_SCHEMA_VERSION = "2.0.0"
 REGIME_HISTORY_SCHEMA_VERSION = "1.0.0"
 ROUTABLE_REGIMES: frozenset[str] = frozenset(
@@ -98,6 +99,7 @@ class CorporateActionsLedger:
     as_of: str
     cash_dividends_by_symbol: dict[str, list[dict[str, Any]]]
     splits_by_symbol: dict[str, list[dict[str, Any]]]
+    unverified_events: list[dict[str, Any]]
 
 
 @dataclass(frozen=True)
@@ -416,6 +418,8 @@ def load_corporate_actions_ledger(
     if not isinstance(splits_raw, Mapping):
         raise ValueError(f"Missing or invalid 'splits_by_symbol' object in {path}")
 
+    unverified_events: list[dict[str, Any]] = []
+
     def parse_symbol_map(
         raw_map: Mapping[str, Any], *, event_kind: str
     ) -> dict[str, list[dict[str, Any]]]:
@@ -447,7 +451,52 @@ def load_corporate_actions_ledger(
                     raw_event.get(value_key),
                     f"{symbol} {event_kind}[{idx}].{value_key}",
                 )
-                parsed_events.append({date_key: event_date, value_key: value})
+                status = raw_event.get("event_status")
+                if not isinstance(status, str) or status not in {"VERIFIED", "PROVISIONAL"}:
+                    raise ValueError(
+                        f"{symbol} {event_kind}[{idx}].event_status must be VERIFIED or PROVISIONAL"
+                    )
+                source_class = raw_event.get("source_class")
+                if not isinstance(source_class, str) or not source_class.strip():
+                    raise ValueError(
+                        f"{symbol} {event_kind}[{idx}].source_class must be non-empty"
+                    )
+                source_pdf = raw_event.get("source_pdf")
+                source_hash = raw_event.get("source_pdf_sha256")
+                if status == "VERIFIED":
+                    if not isinstance(source_pdf, str) or not source_pdf.strip():
+                        raise ValueError(
+                            f"{symbol} {event_kind}[{idx}] VERIFIED event lacks source_pdf"
+                        )
+                    if not isinstance(source_hash, str) or not SHA256_PATTERN.fullmatch(source_hash):
+                        raise ValueError(
+                            f"{symbol} {event_kind}[{idx}] VERIFIED event has invalid source_pdf_sha256"
+                        )
+                event = {
+                    **dict(raw_event),
+                    "symbol": symbol,
+                    "kind": "cash_dividend" if event_kind == "dividend" else "split",
+                    date_key: event_date,
+                    value_key: value,
+                    "event_status": status,
+                    "source_class": source_class.strip(),
+                    "source_pdf": source_pdf,
+                    "source_pdf_sha256": source_hash,
+                }
+                if status == "VERIFIED":
+                    parsed_events.append(event)
+                else:
+                    unverified_events.append(
+                        {
+                            **event,
+                            "date": event_date,
+                            "evidence_gap": (
+                                "缺少官方 PDF / SHA-256"
+                                if not source_pdf or not source_hash
+                                else "事件尚未达到 VERIFIED 状态"
+                            ),
+                        }
+                    )
 
             parsed_events.sort(key=lambda event: event[date_key])
             parsed_map[symbol] = parsed_events
@@ -458,7 +507,46 @@ def load_corporate_actions_ledger(
         as_of=as_of,
         cash_dividends_by_symbol=parse_symbol_map(dividends_raw, event_kind="dividend"),
         splits_by_symbol=parse_symbol_map(splits_raw, event_kind="split"),
+        unverified_events=sorted(
+            unverified_events, key=lambda event: (event["date"], event["symbol"], event["kind"])
+        ),
     )
+
+
+def assess_corporate_actions_gate(
+    as_of: str,
+    target_date: str,
+    unverified_events: Sequence[Mapping[str, Any]] | None = None,
+) -> dict[str, Any]:
+    """Apply the shared hard gate for ledger coverage and effective unverified events."""
+    resolved_as_of = _normalize_iso_date(as_of, "corporate_actions.as_of")
+    resolved_target = _normalize_iso_date(target_date, "corporate_actions.target_date")
+    reasons: list[str] = []
+    if resolved_target > resolved_as_of:
+        reasons.append(
+            f"公司行为台账覆盖截止 {resolved_as_of} 早于目标交易日 {resolved_target}"
+        )
+    active_unverified: list[dict[str, Any]] = []
+    for raw_event in unverified_events or []:
+        effective_date = _normalize_iso_date(
+            raw_event.get("date"), "corporate_actions.unverified_event.date"
+        )
+        if effective_date <= resolved_target:
+            active_unverified.append(dict(raw_event))
+    if active_unverified:
+        reasons.append(f"{len(active_unverified)} 个未 VERIFIED 公司行为已在目标日生效")
+        for event in active_unverified:
+            reasons.append(
+                f"{event.get('event_status')} {event.get('kind')} {event.get('symbol')} "
+                f"effective={event.get('date')}: {event.get('evidence_gap') or '证据状态待核验'}"
+            )
+    return {
+        "allowed": not reasons,
+        "target_date": resolved_target,
+        "as_of": resolved_as_of,
+        "reasons": reasons,
+        "unverified_events": active_unverified,
+    }
 
 
 def load_regime_history(regime_history_file: str | Path) -> RegimeHistory:
@@ -920,6 +1008,7 @@ def load_market_bundle(config: Mapping[str, Any] | str | Path) -> MarketBundle:
         "calendar_start_date": all_calendar_rows[0],
         "calendar_end_date": all_calendar_rows[-1],
         "corporate_actions_as_of": ledger.as_of,
+        "unverified_corporate_action_events": [dict(event) for event in ledger.unverified_events],
         "regime_history_anchor_start_date": regime_history.anchor_start_date,
         "source_files": source_files,
         "symbol_stats": symbol_stats,

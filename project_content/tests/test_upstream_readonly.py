@@ -77,7 +77,7 @@ def test_upstream_artifacts_cover_all_symbols_without_being_modified() -> None:
     assert set(ledger.cash_dividends_by_symbol) >= set(EXPECTED_SYMBOLS)
     assert set(ledger.splits_by_symbol) >= set(EXPECTED_SYMBOLS)
     assert ledger.schema_version == "2.0.0"
-    assert ledger.as_of == "2026-11-25"
+    assert ledger.as_of == "2026-11-26"
     assert set(watchlist) >= set(EXPECTED_SYMBOLS)
     assert set(regimes.initial_regimes) == set(EXPECTED_SYMBOLS[1:])
     assert all(regimes.regime_for(symbol, "2026-11-23") for symbol in EXPECTED_SYMBOLS[1:])
@@ -105,7 +105,11 @@ def test_real_ledger_has_sorted_dividends_and_split_factor() -> None:
     assert [event["ex_date"] for event in dividends] == sorted(
         event["ex_date"] for event in dividends
     )
-    assert dividends[0] == {"ex_date": "2024-05-28", "cash_per_unit": 0.0031}
+    assert dividends[0]["ex_date"] == "2024-05-28"
+    assert dividends[0]["cash_per_unit"] == 0.0031
+    assert dividends[0]["event_status"] == "VERIFIED"
+    assert dividends[0]["source_pdf"]
+    assert len(dividends[0]["source_pdf_sha256"]) == 64
     assert dividends[-1]["ex_date"] == "2026-11-13"
 
     splits = ledger.splits_by_symbol["512480.SH"]

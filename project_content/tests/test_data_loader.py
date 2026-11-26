@@ -21,6 +21,7 @@ from src.data_loader import (
     load_sim_config,
     load_tdx_daily,
     load_trade_calendar,
+    assess_corporate_actions_gate,
 )
 
 EXPECTED_SYMBOLS = [
@@ -161,7 +162,7 @@ def test_real_market_bundle_uses_bs01_calendar_and_ledger() -> None:
     assert set(bundle.symbols) == set(EXPECTED_SYMBOLS)
     assert set(bundle.bars) == set(EXPECTED_SYMBOLS)
     assert bundle.metadata["calendar_file"].endswith("20261126_100336.csv")
-    assert bundle.metadata["corporate_actions_as_of"] == "2026-11-25"
+    assert bundle.metadata["corporate_actions_as_of"] == "2026-11-26"
     assert bundle.regime_history.anchor_start_date == "2026-11-23"
     assert bundle.authoritative_trading_dates == sorted(
         bundle.authoritative_trading_dates
@@ -227,33 +228,92 @@ def test_corporate_actions_ledger_sorts_events_and_validates_schema(tmp_path: Pa
             "as_of": "2026-11-26",
             "cash_dividends_by_symbol": {
                 "510720.SH": [
-                    {"ex_date": "2026-11-25", "cash_per_unit": 0.02},
-                    {"ex_date": "2026-11-23", "cash_per_unit": 0.01},
+                    {
+                        "ex_date": "2026-11-25", "cash_per_unit": 0.02,
+                        "source_class": "OFFICIAL_TEST", "event_status": "VERIFIED",
+                        "source_pdf": "raw/test/dividend.pdf", "source_pdf_sha256": "a" * 64,
+                    },
+                    {
+                        "ex_date": "2026-11-23", "cash_per_unit": 0.01,
+                        "source_class": "OFFICIAL_TEST", "event_status": "VERIFIED",
+                        "source_pdf": "raw/test/dividend.pdf", "source_pdf_sha256": "a" * 64,
+                    },
                 ]
             },
             "splits_by_symbol": {
                 "512480.SH": [
-                    {"effective_date": "2026-11-25", "factor": 0.5},
-                    {"effective_date": "2026-11-23", "factor": 0.8},
+                    {
+                        "effective_date": "2026-11-25", "factor": 0.5,
+                        "source_class": "OFFICIAL_TEST", "event_status": "VERIFIED",
+                        "source_pdf": "raw/test/split.pdf", "source_pdf_sha256": "b" * 64,
+                    },
+                    {
+                        "effective_date": "2026-11-23", "factor": 0.8,
+                        "source_class": "OFFICIAL_TEST", "event_status": "VERIFIED",
+                        "source_pdf": "raw/test/split.pdf", "source_pdf_sha256": "b" * 64,
+                    },
                 ]
             },
         },
     )
     ledger = load_corporate_actions_ledger(ledger_path)
     assert ledger.as_of == "2026-11-26"
-    assert ledger.cash_dividends_by_symbol["510720.SH"] == [
-        {"ex_date": "2026-11-23", "cash_per_unit": 0.01},
-        {"ex_date": "2026-11-25", "cash_per_unit": 0.02},
+    assert [event["ex_date"] for event in ledger.cash_dividends_by_symbol["510720.SH"]] == [
+        "2026-11-23", "2026-11-25"
     ]
-    assert ledger.splits_by_symbol["512480.SH"] == [
-        {"effective_date": "2026-11-23", "factor": 0.8},
-        {"effective_date": "2026-11-25", "factor": 0.5},
+    assert [event["effective_date"] for event in ledger.splits_by_symbol["512480.SH"]] == [
+        "2026-11-23", "2026-11-25"
     ]
+    assert all(
+        event["event_status"] == "VERIFIED"
+        and event["source_class"] == "OFFICIAL_TEST"
+        and event["source_pdf_sha256"] == "a" * 64
+        for event in ledger.cash_dividends_by_symbol["510720.SH"]
+    )
 
     invalid_path = tmp_path / "invalid_ledger.json"
     _write_json(invalid_path, {"schema_version": "1.0.0", "as_of": "2026-11-26"})
     with pytest.raises(ValueError, match="schema_version"):
         load_corporate_actions_ledger(invalid_path)
+
+
+def test_provisional_actions_are_retained_but_never_applied(tmp_path: Path) -> None:
+    config = _make_synthetic_config(
+        tmp_path,
+        {"159330.SZ": ISO_DAYS, "512400.SH": ISO_DAYS},
+    )
+    ledger_path = Path(config["upstream_paths"]["corporate_actions_ledger_file"])
+    payload = json.loads(ledger_path.read_text(encoding="utf-8"))
+    payload["splits_by_symbol"]["512400.SH"] = [
+        {
+            "effective_date": "2026-11-25", "factor": 0.5,
+            "source_class": "PROVISIONAL_TEST", "event_status": "PROVISIONAL",
+            "source_pdf": None, "source_pdf_sha256": None,
+        }
+    ]
+    _write_json(ledger_path, payload)
+
+    bundle = load_market_bundle(config)
+    assert bundle.splits["512400.SH"] == []
+    assert bundle.adjusted_bars["512400.SH"]["adj_factor"].tolist() == [1.0] * len(ISO_DAYS)
+    pending = bundle.metadata["unverified_corporate_action_events"]
+    assert len(pending) == 1
+    assert pending[0]["event_status"] == "PROVISIONAL"
+    assert pending[0]["source_class"] == "PROVISIONAL_TEST"
+    assert pending[0]["date"] == "2026-11-25"
+    assert "缺少官方 PDF" in pending[0]["evidence_gap"]
+
+
+def test_shared_gate_blocks_lag_and_effective_provisional_events() -> None:
+    future = [{"date": "2026-11-27", "symbol": "512400.SH", "event_status": "PROVISIONAL"}]
+    assert assess_corporate_actions_gate("2026-11-26", "2026-11-26", future)["allowed"]
+    lag = assess_corporate_actions_gate("2026-11-25", "2026-11-26", [])
+    assert not lag["allowed"]
+    effective = assess_corporate_actions_gate("2026-11-26", "2026-11-26", future[:0] + [
+        {"date": "2026-11-26", "symbol": "512400.SH", "event_status": "PROVISIONAL"}
+    ])
+    assert not effective["allowed"]
+    assert effective["unverified_events"][0]["symbol"] == "512400.SH"
 
 
 def test_real_512480_split_adjustment_comes_from_the_ledger() -> None:

@@ -8,7 +8,11 @@ from datetime import date, timedelta
 import math
 from typing import Any, Mapping, Sequence
 
-from src.data_loader import MarketBundle, build_forward_adjusted_daily
+from src.data_loader import (
+    MarketBundle,
+    assess_corporate_actions_gate,
+    build_forward_adjusted_daily,
+)
 from src.strategies import (
     GridConfig,
     GridState,
@@ -538,8 +542,14 @@ class SimulationEngine:
         index = self.trading_days_processed
         if index >= len(self._trading_dates) or trade_date != self._trading_dates[index]:
             raise ValueError(f"{trade_date} is not the next BS-01 trading date")
-        if trade_date > self.bundle.metadata["corporate_actions_as_of"]:
-            raise ValueError(f"Corporate-actions ledger does not cover {trade_date}")
+        gate = assess_corporate_actions_gate(
+            self.bundle.metadata["corporate_actions_as_of"],
+            trade_date,
+            self.bundle.metadata.get("unverified_corporate_action_events", []),
+        )
+        if not gate["allowed"]:
+            details = "; ".join(gate["reasons"])
+            raise ValueError(f"Corporate-actions formal-run gate blocked {trade_date}: {details}")
 
         targets = {}
         for symbol in self.sectors:
@@ -593,8 +603,17 @@ class SimulationEngine:
     def run(self, end_date: str | None = None) -> dict[str, Any]:
         end = end_date or self._trading_dates[-1]
         dates = [day for day in self._trading_dates[self.trading_days_processed:] if day <= end]
-        if dates and dates[-1] > self.bundle.metadata["corporate_actions_as_of"]:
-            raise ValueError(f"Corporate-actions ledger does not cover {dates[-1]}")
+        if dates:
+            gate = assess_corporate_actions_gate(
+                self.bundle.metadata["corporate_actions_as_of"],
+                dates[-1],
+                self.bundle.metadata.get("unverified_corporate_action_events", []),
+            )
+            if not gate["allowed"]:
+                details = "; ".join(gate["reasons"])
+                raise ValueError(
+                    f"Corporate-actions formal-run gate blocked {dates[-1]}: {details}"
+                )
         for trade_date in dates:
             self.step_day(trade_date)
         return {"processed_dates": dates, "last_processed_date": self.last_processed_date}

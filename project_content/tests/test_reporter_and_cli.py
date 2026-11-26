@@ -111,11 +111,19 @@ def make_inputs(tmp_path: Path, *, lag_symbol=None, all_lag=False) -> Inputs:
         "schema_version": "2.0.0",
         "as_of": dates[-1],
         "cash_dividends_by_symbol": {
-            symbol: [{"ex_date": dates[2], "cash_per_unit": 0.06}] if symbol == GRID else []
+            symbol: [{
+                "ex_date": dates[2], "cash_per_unit": 0.06,
+                "source_class": "OFFICIAL_TEST", "event_status": "VERIFIED",
+                "source_pdf": "raw/test/dividend.pdf", "source_pdf_sha256": "a" * 64,
+            }] if symbol == GRID else []
             for symbol in symbols
         },
         "splits_by_symbol": {
-            symbol: [{"effective_date": dates[6], "factor": 0.5}] if symbol == SPLIT else []
+            symbol: [{
+                "effective_date": dates[6], "factor": 0.5,
+                "source_class": "OFFICIAL_TEST", "event_status": "VERIFIED",
+                "source_pdf": "raw/test/split.pdf", "source_pdf_sha256": "b" * 64,
+            }] if symbol == SPLIT else []
             for symbol in symbols
         },
     })
@@ -292,7 +300,32 @@ def test_lag_override_cannot_bypass_missing_corporate_actions_coverage(tmp_path,
     write_json(inputs.ledger, ledger)
     output = tmp_path / "output"
     assert cli_main(inputs.args(output, "--allow-lag", as_of=inputs.dates[-1])) == 2
-    assert "Corporate-actions ledger does not cover" in capsys.readouterr().err
+    assert "公司行为台账门禁阻断正式运行" in capsys.readouterr().err
+    assert not output.exists()
+
+
+def test_provisional_effective_event_blocks_formal_and_dry_run_without_output(tmp_path, capsys):
+    inputs = make_inputs(tmp_path)
+    ledger = json.loads(inputs.ledger.read_text(encoding="utf-8"))
+    ledger["splits_by_symbol"][SPLIT] = [{
+        "effective_date": inputs.dates[1], "factor": 0.5,
+        "source_class": "PROVISIONAL_TEST", "event_status": "PROVISIONAL",
+        "source_pdf": None, "source_pdf_sha256": None,
+    }]
+    write_json(inputs.ledger, ledger)
+    output = tmp_path / "output"
+
+    assert cli_main(inputs.args(output, "--dry-run", as_of=inputs.dates[2])) == 2
+    diagnostic = capsys.readouterr().out
+    assert "[DRY-RUN][BLOCKED]" in diagnostic
+    assert "PROVISIONAL" in diagnostic and "缺少官方 PDF" in diagnostic
+    assert SPLIT in diagnostic
+    assert not output.exists()
+
+    assert cli_main(inputs.args(output, as_of=inputs.dates[2])) == 2
+    formal_error = capsys.readouterr().err
+    assert "公司行为台账门禁阻断正式运行" in formal_error
+    assert SPLIT in formal_error and "缺少官方 PDF" in formal_error
     assert not output.exists()
 
 
