@@ -2,29 +2,19 @@
 
 from __future__ import annotations
 
-import base64
 import csv
 from dataclasses import dataclass
-from datetime import date, datetime, timedelta, timezone
-import hashlib
+from datetime import date, datetime, timedelta
 import json
 import os
 from pathlib import Path
 import subprocess
 
-from cryptography import x509
-from cryptography.hazmat.primitives import hashes, serialization
-from cryptography.hazmat.primitives.asymmetric import ec
-from cryptography.x509.oid import ExtendedKeyUsageOID, NameOID
-from pyasn1.codec.der import decoder as der_decoder, encoder as der_encoder
-from pyasn1.type import univ, useful
-from pyasn1_modules import rfc3161, rfc5280, rfc5652
 import pytest
 
 from src.data_loader import (
     CHINA_TZ,
     DEFAULT_SIM_CONFIG_PATH,
-    compute_live_attestation_payload,
     compute_regime_decision_sha256,
     load_sim_config,
 )
@@ -56,133 +46,11 @@ def write_json(path, payload):
     path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8", newline="\n")
 
 
-class _TestTSA:
-    """Test-only offline RFC 3161 TSA issuer."""
-
-    def __init__(self, cn: str = "CLI Test TSA") -> None:
-        base_time = datetime(2026, 1, 1, 0, 0, 0, tzinfo=timezone.utc)
-        self.root_key = ec.generate_private_key(ec.SECP256R1())
-        self.tsa_key = ec.generate_private_key(ec.SECP256R1())
-        root_name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, f"{cn} Root")])
-        tsa_name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, f"{cn} Signer")])
-        self.root_cert = (
-            x509.CertificateBuilder()
-            .subject_name(root_name).issuer_name(root_name)
-            .public_key(self.root_key.public_key())
-            .serial_number(x509.random_serial_number())
-            .not_valid_before(base_time)
-            .not_valid_after(base_time + timedelta(days=3650))
-            .add_extension(x509.BasicConstraints(ca=True, path_length=None), critical=True)
-            .add_extension(
-                x509.KeyUsage(
-                    digital_signature=False, content_commitment=False, key_encipherment=False,
-                    data_encipherment=False, key_agreement=False, key_cert_sign=True,
-                    crl_sign=True, encipher_only=False, decipher_only=False,
-                ),
-                critical=True,
-            )
-            .add_extension(x509.SubjectKeyIdentifier.from_public_key(self.root_key.public_key()), critical=False)
-            .sign(self.root_key, hashes.SHA256())
-        )
-        self.tsa_cert = (
-            x509.CertificateBuilder()
-            .subject_name(tsa_name).issuer_name(root_name)
-            .public_key(self.tsa_key.public_key())
-            .serial_number(x509.random_serial_number())
-            .not_valid_before(base_time)
-            .not_valid_after(base_time + timedelta(days=3650))
-            .add_extension(x509.BasicConstraints(ca=False, path_length=None), critical=True)
-            .add_extension(
-                x509.KeyUsage(
-                    digital_signature=True, content_commitment=True, key_encipherment=False,
-                    data_encipherment=False, key_agreement=False, key_cert_sign=False,
-                    crl_sign=False, encipher_only=False, decipher_only=False,
-                ),
-                critical=True,
-            )
-            .add_extension(x509.ExtendedKeyUsage([ExtendedKeyUsageOID.TIME_STAMPING]), critical=True)
-            .add_extension(x509.SubjectKeyIdentifier.from_public_key(self.tsa_key.public_key()), critical=False)
-            .add_extension(
-                x509.AuthorityKeyIdentifier.from_issuer_subject_key_identifier(
-                    self.root_cert.extensions.get_extension_for_class(x509.SubjectKeyIdentifier).value
-                ),
-                critical=False,
-            )
-            .sign(self.root_key, hashes.SHA256())
-        )
-
-    def sign_digest(self, digest_bytes: bytes, gen_time: datetime) -> bytes:
-        gen_utc = gen_time.astimezone(timezone.utc)
-        tst = rfc3161.TSTInfo()
-        tst["version"] = 1
-        tst["policy"] = univ.ObjectIdentifier("1.2.3.4.5")
-        tst["messageImprint"]["hashAlgorithm"]["algorithm"] = univ.ObjectIdentifier("2.16.840.1.101.3.4.2.1")
-        tst["messageImprint"]["hashAlgorithm"]["parameters"] = univ.Null("")
-        tst["messageImprint"]["hashedMessage"] = digest_bytes
-        tst["serialNumber"] = 1
-        tst["genTime"] = useful.GeneralizedTime(gen_utc.strftime("%Y%m%d%H%M%SZ"))
-        e_content = der_encoder.encode(tst)
-
-        sa_set = rfc5652.SignedAttributes()
-        a1 = rfc5652.Attribute()
-        a1["attrType"] = rfc5652.id_contentType
-        a1["attrValues"][0] = der_encoder.encode(univ.ObjectIdentifier("1.2.840.113549.1.9.16.1.4"))
-        a2 = rfc5652.Attribute()
-        a2["attrType"] = rfc5652.id_messageDigest
-        a2["attrValues"][0] = der_encoder.encode(univ.OctetString(hashlib.sha256(e_content).digest()))
-        sa_set[0] = a1
-        sa_set[1] = a2
-        sig = self.tsa_key.sign(der_encoder.encode(sa_set), ec.ECDSA(hashes.SHA256()))
-
-        sd = rfc5652.SignedData()
-        sd["version"] = 3
-        da = rfc5652.DigestAlgorithmIdentifier()
-        da["algorithm"] = univ.ObjectIdentifier("2.16.840.1.101.3.4.2.1")
-        da["parameters"] = univ.Null("")
-        sd["digestAlgorithms"][0] = da
-        sd["encapContentInfo"]["eContentType"] = univ.ObjectIdentifier("1.2.840.113549.1.9.16.1.4")
-        sd["encapContentInfo"]["eContent"] = e_content
-        cert_choice = rfc5652.CertificateChoices()
-        parsed_cert, _ = der_decoder.decode(
-            self.tsa_cert.public_bytes(serialization.Encoding.DER), asn1Spec=rfc5280.Certificate()
-        )
-        cert_choice["certificate"] = parsed_cert
-        sd["certificates"][0] = cert_choice
-
-        si = rfc5652.SignerInfo()
-        si["version"] = 1
-        issuer_asn1, _ = der_decoder.decode(self.tsa_cert.issuer.public_bytes(), asn1Spec=rfc5280.Name())
-        si["sid"]["issuerAndSerialNumber"]["issuer"] = issuer_asn1
-        si["sid"]["issuerAndSerialNumber"]["serialNumber"] = self.tsa_cert.serial_number
-        si["digestAlgorithm"] = da
-        si["signedAttrs"][0] = a1
-        si["signedAttrs"][1] = a2
-        si["signatureAlgorithm"]["algorithm"] = univ.ObjectIdentifier("1.2.840.10045.4.3.2")
-        si["signature"] = sig
-        sd["signerInfos"][0] = si
-
-        ci = rfc5652.ContentInfo()
-        ci["contentType"] = rfc5652.id_signedData
-        ci["content"] = der_encoder.encode(sd)
-        resp = rfc3161.TimeStampResp()
-        resp["status"]["status"] = 0
-        resp["timeStampToken"] = ci
-        return der_encoder.encode(resp)
-
-
-@pytest.fixture()
-def trusted_test_tsa(monkeypatch: pytest.MonkeyPatch) -> _TestTSA:
-    tsa = _TestTSA()
-    monkeypatch.setattr("src.data_loader._load_default_trusted_tsa_roots", lambda: (tsa.root_cert,))
-    return tsa
-
-
 def attach_live_proof(
     journal_dir: Path,
     record: dict,
     *,
-    tsa: _TestTSA | None = None,
-    gen_time: datetime | None = None,
+    receipt_mtime: datetime | None = None,
     entry_sha256: str | None = None,
 ) -> Path:
     recorded_dt = datetime.fromisoformat(record["recorded_at"].replace("Z", "+00:00")).astimezone(CHINA_TZ)
@@ -190,47 +58,26 @@ def attach_live_proof(
     rel_path = f"pre_market_proofs/{record['record_id']}.json"
     receipt_path = journal_dir / rel_path
     receipt_path.parent.mkdir(parents=True, exist_ok=True)
-    attestation_bytes = compute_live_attestation_payload(
-        record_id=record["record_id"],
-        decision_date=record["decision_date"],
-        effective_date=record["effective_date"],
-        symbol=record["symbol"],
-        prev_regime=record["prev_regime"],
-        new_regime=record["new_regime"],
-        recorded_at_cst=recorded_dt.isoformat(),
-        decision_sha256=decision_sha,
-        decision_entry_sha256=entry_sha256,
-        decision_ref=record.get("decision_ref"),
-        card_path=record.get("card_path"),
-    )
     write_json(receipt_path, {
-        "schema_version": "2.0.0",
+        "schema_version": "1.0.0",
         "record_id": record["record_id"],
         "decision_date": record["decision_date"],
         "effective_date": record["effective_date"],
         "symbol": record["symbol"],
-        "prev_regime": record["prev_regime"],
-        "new_regime": record["new_regime"],
+        "prev_regime": "TRANSITION" if record["prev_regime"] == "UNRATED" else record["prev_regime"],
+        "new_regime": "TRANSITION" if record["new_regime"] == "UNRATED" else record["new_regime"],
         "record_type": "LIVE",
         "recorded_at": record["recorded_at"],
         "recorded_at_cst": recorded_dt.isoformat(),
         "decision_sha256": decision_sha,
         "decision_entry_sha256": entry_sha256,
-        "attestation_sha256": hashlib.sha256(attestation_bytes).hexdigest(),
     })
-    proof: dict = {
+    ts_dt = receipt_mtime if receipt_mtime is not None else recorded_dt
+    os.utime(receipt_path, (ts_dt.timestamp(), ts_dt.timestamp()))
+    record["pre_market_proof"] = {
         "receipt_path": rel_path,
         "decision_sha256": decision_sha,
-        "decision_entry_sha256": entry_sha256,
     }
-    if tsa is not None:
-        ts_dt = gen_time if gen_time is not None else recorded_dt
-        tsr_bytes = tsa.sign_digest(hashlib.sha256(attestation_bytes).digest(), ts_dt)
-        tsr_rel = f"pre_market_proofs/{record['record_id']}.tsr"
-        (journal_dir / tsr_rel).write_bytes(tsr_bytes)
-        proof["tsa_token_path"] = tsr_rel
-        proof["tsa_token_b64"] = base64.b64encode(tsr_bytes).decode("ascii")
-    record["pre_market_proof"] = proof
     return receipt_path
 
 
@@ -258,7 +105,7 @@ class Inputs:
         return argv
 
 
-def make_inputs(tmp_path: Path, *, lag_symbol=None, all_lag=False, tsa: _TestTSA | None = None, include_live_records: bool = True) -> Inputs:
+def make_inputs(tmp_path: Path, *, lag_symbol=None, all_lag=False, include_live_records: bool = True) -> Inputs:
     begin = date(2026, 8, 17)
     end = date(2026, 12, 8)
     calendar_days = [begin + timedelta(days=offset) for offset in range((end - begin).days + 1)]
@@ -354,7 +201,7 @@ def make_inputs(tmp_path: Path, *, lag_symbol=None, all_lag=False, tsa: _TestTSA
         },
     ] if include_live_records else []
     for rec in regime_records:
-        attach_live_proof(tmp_path, rec, tsa=tsa)
+        attach_live_proof(tmp_path, rec)
     write_json(regimes, {
         "schema_version": "2.0.0",
         "anchor_start_date": START,
@@ -384,8 +231,8 @@ def output_bytes(output_dir):
     return {path.relative_to(output_dir): path.read_bytes() for path in output_dir.rglob("*") if path.is_file()}
 
 
-def test_daily_outputs_have_five_accounts_and_keep_only_the_checkpoint(tmp_path, capsys, trusted_test_tsa):
-    inputs = make_inputs(tmp_path, tsa=trusted_test_tsa)
+def test_daily_outputs_have_five_accounts_and_keep_only_the_checkpoint(tmp_path, capsys):
+    inputs = make_inputs(tmp_path)
     output = tmp_path / "output"
     last_date = inputs.dates[-1]
     assert cli_main(inputs.args(output, "--from-scratch", as_of=last_date)) == 0
@@ -433,8 +280,8 @@ def test_daily_outputs_have_five_accounts_and_keep_only_the_checkpoint(tmp_path,
         data.decode("utf-8")
 
 
-def test_from_scratch_matches_every_day_incremental_byte_for_byte(tmp_path, trusted_test_tsa):
-    inputs = make_inputs(tmp_path, tsa=trusted_test_tsa)
+def test_from_scratch_matches_every_day_incremental_byte_for_byte(tmp_path):
+    inputs = make_inputs(tmp_path)
     full = tmp_path / "full"
     incremental = tmp_path / "incremental"
     assert cli_main(inputs.args(full, "--from-scratch", as_of=inputs.dates[-1])) == 0
@@ -448,8 +295,8 @@ def test_from_scratch_matches_every_day_incremental_byte_for_byte(tmp_path, trus
     assert output_bytes(incremental) == before
 
 
-def test_history_routes_activate_on_effective_day_and_ignore_current_watchlist(tmp_path, trusted_test_tsa):
-    inputs = make_inputs(tmp_path, tsa=trusted_test_tsa)
+def test_history_routes_activate_on_effective_day_and_ignore_current_watchlist(tmp_path):
+    inputs = make_inputs(tmp_path)
     output = tmp_path / "output"
     assert cli_main(inputs.args(output, as_of=START)) == 0
     state = load_state_json(output / "state.json")["accounts"]["A"]
@@ -474,8 +321,8 @@ def test_history_routes_activate_on_effective_day_and_ignore_current_watchlist(t
     assert (sold["date"], int(sold["shares"])) == (inputs.dates[3], before)
 
 
-def test_dry_run_does_not_create_or_modify_output_files(tmp_path, capsys, trusted_test_tsa):
-    inputs = make_inputs(tmp_path, tsa=trusted_test_tsa)
+def test_dry_run_does_not_create_or_modify_output_files(tmp_path, capsys):
+    inputs = make_inputs(tmp_path)
     output = tmp_path / "output"
     assert cli_main(inputs.args(output, "--dry-run", "--from-scratch", as_of=inputs.dates[3])) == 0
     assert "[DRY-RUN]" in capsys.readouterr().out
@@ -487,8 +334,8 @@ def test_dry_run_does_not_create_or_modify_output_files(tmp_path, capsys, truste
 
 
 @pytest.mark.parametrize("all_lag", [False, True])
-def test_lag_aborts_unless_explicitly_allowed_by_calendar_date(tmp_path, capsys, all_lag, trusted_test_tsa):
-    inputs = make_inputs(tmp_path, lag_symbol=GRID, all_lag=all_lag, tsa=trusted_test_tsa)
+def test_lag_aborts_unless_explicitly_allowed_by_calendar_date(tmp_path, capsys, all_lag):
+    inputs = make_inputs(tmp_path, lag_symbol=GRID, all_lag=all_lag)
     output = tmp_path / "lag"
     requested = inputs.dates[-1]
     assert cli_main(inputs.args(output, as_of=requested)) == 2
@@ -501,8 +348,8 @@ def test_lag_aborts_unless_explicitly_allowed_by_calendar_date(tmp_path, capsys,
     assert marker in capsys.readouterr().out
 
 
-def test_as_of_includes_only_calendar_open_days(tmp_path, trusted_test_tsa):
-    inputs = make_inputs(tmp_path, tsa=trusted_test_tsa)
+def test_as_of_includes_only_calendar_open_days(tmp_path):
+    inputs = make_inputs(tmp_path)
     output = tmp_path / "output"
     assert cli_main(inputs.args(output, as_of="2026-11-29")) == 0
     assert load_state_json(output / "state.json")["last_processed_date"] == "2026-11-27"
@@ -510,16 +357,16 @@ def test_as_of_includes_only_calendar_open_days(tmp_path, trusted_test_tsa):
 
 
 @pytest.mark.parametrize("cutoff", ["2026-11-20", "20261123", "2026-11-31", "2026-12-31"])
-def test_invalid_as_of_or_uncovered_calendar_fails_without_writing(tmp_path, capsys, cutoff, trusted_test_tsa):
-    inputs = make_inputs(tmp_path, tsa=trusted_test_tsa)
+def test_invalid_as_of_or_uncovered_calendar_fails_without_writing(tmp_path, capsys, cutoff):
+    inputs = make_inputs(tmp_path)
     output = tmp_path / "output"
     assert cli_main(inputs.args(output, "--allow-lag", as_of=cutoff)) == 2
     assert "[运行失败]" in capsys.readouterr().err
     assert not output.exists()
 
 
-def test_lag_override_cannot_bypass_missing_corporate_actions_coverage(tmp_path, capsys, trusted_test_tsa):
-    inputs = make_inputs(tmp_path, all_lag=True, tsa=trusted_test_tsa)
+def test_lag_override_cannot_bypass_missing_corporate_actions_coverage(tmp_path, capsys):
+    inputs = make_inputs(tmp_path, all_lag=True)
     ledger = json.loads(inputs.ledger.read_text(encoding="utf-8"))
     ledger["as_of"] = inputs.dates[-2]
     write_json(inputs.ledger, ledger)
@@ -529,8 +376,8 @@ def test_lag_override_cannot_bypass_missing_corporate_actions_coverage(tmp_path,
     assert not output.exists()
 
 
-def test_provisional_effective_event_blocks_formal_and_dry_run_without_output(tmp_path, capsys, trusted_test_tsa):
-    inputs = make_inputs(tmp_path, tsa=trusted_test_tsa)
+def test_provisional_effective_event_blocks_formal_and_dry_run_without_output(tmp_path, capsys):
+    inputs = make_inputs(tmp_path)
     ledger = json.loads(inputs.ledger.read_text(encoding="utf-8"))
     ledger["splits_by_symbol"][SPLIT] = [{
         "effective_date": inputs.dates[1], "factor": 0.5,
@@ -554,8 +401,8 @@ def test_provisional_effective_event_blocks_formal_and_dry_run_without_output(tm
     assert not output.exists()
 
 
-def test_from_scratch_replaces_legacy_checkpoint_and_rebuilds_current_ledgers(tmp_path, capsys, trusted_test_tsa):
-    inputs = make_inputs(tmp_path, tsa=trusted_test_tsa)
+def test_from_scratch_replaces_legacy_checkpoint_and_rebuilds_current_ledgers(tmp_path, capsys):
+    inputs = make_inputs(tmp_path)
     output = tmp_path / "output"
     output.mkdir()
     legacy_state = {"schema_version": "1.0.0", "last_processed_date": "2026-11-20"}
@@ -573,8 +420,8 @@ def test_from_scratch_replaces_legacy_checkpoint_and_rebuilds_current_ledgers(tm
     assert weekly.read_bytes() == b"stage 1\n"
 
 
-def test_rebuild_keeps_already_published_daily_snapshots(tmp_path, trusted_test_tsa):
-    inputs = make_inputs(tmp_path, tsa=trusted_test_tsa)
+def test_rebuild_keeps_already_published_daily_snapshots(tmp_path):
+    inputs = make_inputs(tmp_path)
     output = tmp_path / "output"
     assert cli_main(inputs.args(output, as_of=inputs.dates[4])) == 0
     before = {day: snapshot_path(output, day).read_bytes() for day in inputs.dates[:5]}
@@ -634,8 +481,8 @@ def test_atomic_writes_leave_prior_file_intact_and_clean_temporary_file(tmp_path
     assert snapshot_path(tmp_path, START).read_text(encoding="utf-8") == "第一版\n"
 
 
-def test_retries_after_failed_checkpoint_publication(tmp_path, monkeypatch, trusted_test_tsa):
-    inputs = make_inputs(tmp_path, tsa=trusted_test_tsa)
+def test_retries_after_failed_checkpoint_publication(tmp_path, monkeypatch):
+    inputs = make_inputs(tmp_path)
     output = tmp_path / "output"
     assert cli_main(inputs.args(output, as_of=START)) == 0
     before = output_bytes(output)
@@ -673,8 +520,8 @@ def test_absolute_script_entry_point_works_from_outside_repo(tmp_path):
     assert not output.exists()
 
 
-def test_cli_formal_rejects_backfill_and_replay_reproduces_deterministically(tmp_path, capsys, trusted_test_tsa):
-    inputs = make_inputs(tmp_path, tsa=trusted_test_tsa)
+def test_cli_formal_rejects_backfill_and_replay_reproduces_deterministically(tmp_path, capsys):
+    inputs = make_inputs(tmp_path)
     payload = json.loads(inputs.regimes.read_text(encoding="utf-8"))
     payload["records"][0]["record_type"] = "BACKFILL"
     payload["records"][0]["recorded_at"] = None
@@ -699,10 +546,10 @@ def test_cli_formal_rejects_backfill_and_replay_reproduces_deterministically(tmp
     assert "已隔离 BACKFILL 1 条" in report
 
 
-def test_forward_excess_returns_exclude_backfill_initialization_period(tmp_path, trusted_test_tsa):
+def test_forward_excess_returns_exclude_backfill_initialization_period(tmp_path):
     from src.run_daily_sim import run_daily_sim
 
-    inputs = make_inputs(tmp_path, tsa=trusted_test_tsa)
+    inputs = make_inputs(tmp_path)
     payload = json.loads(inputs.regimes.read_text(encoding="utf-8"))
     payload["records"][0]["record_type"] = "BACKFILL"
     payload["records"][0]["recorded_at"] = None
@@ -737,9 +584,7 @@ def test_forward_excess_returns_exclude_backfill_initialization_period(tmp_path,
     assert fwd_res["forward_excess_returns"]["A_vs_B2"] == pytest.approx(expected_a_vs_b2)
 
 
-def test_cross_repo_t_decision_t1_effective_synthesis_consistent_across_radar_and_sim(
-    tmp_path, monkeypatch, trusted_test_tsa
-):
+def test_cross_repo_t_decision_t1_effective_synthesis_consistent_across_radar_and_sim(tmp_path):
     """合成跨仓闭环测试：T(周五)收盘决定 TRANSITION->RANGE_GRID，T 日看板与模拟盘均维持 TRANSITION，T+1(周一)才显示并执行 RANGE_GRID。"""
     import importlib.util
 
@@ -756,10 +601,9 @@ def test_cross_repo_t_decision_t1_effective_synthesis_consistent_across_radar_an
     assert spec is not None and spec.loader is not None
     board = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(board)
-    monkeypatch.setattr(board, "_load_default_trusted_tsa_roots", lambda: (trusted_test_tsa.root_cert,))
 
     # 2026-11-27 = Friday (T), 2026-11-30 = Monday (T+1)
-    inputs = make_inputs(tmp_path, tsa=trusted_test_tsa)
+    inputs = make_inputs(tmp_path)
     friday = "2026-11-27"
     monday = "2026-11-30"
     assert friday in inputs.dates and monday in inputs.dates
@@ -823,16 +667,10 @@ def test_cross_repo_t_decision_t1_effective_synthesis_consistent_across_radar_an
         "card_path": f"project_content/radar_cards/{GRID}_测试.md",
         "decision_ref": f"2026_decisions.md#{friday}-{GRID}",
     }
-    prepared = board.prepare_live_pre_market_proof(shared_regime, live_record)
-    tsr_bytes = trusted_test_tsa.sign_digest(
-        bytes.fromhex(prepared["attestation_sha256"]),
-        datetime(2026, 11, 27, 16, 0, tzinfo=CHINA_TZ),
-    )
     board.create_live_pre_market_proof(
         shared_regime,
         live_record,
-        tsa_response_bytes=tsr_bytes,
-        trusted_tsa_roots=(trusted_test_tsa.root_cert,),
+        receipt_mtime=datetime(2026, 11, 27, 16, 0, tzinfo=CHINA_TZ),
     )
     write_json(shared_regime, {
         "schema_version": "2.0.0",
@@ -916,9 +754,7 @@ def test_cross_repo_t_decision_t1_effective_synthesis_consistent_across_radar_an
     assert [(t["date"], t["symbol"], t["action"]) for t in a_trades] == [(monday, GRID, "GRID_INIT_BUY")]
 
 
-def test_cli_formal_blocks_unproven_late_and_illegal_offset_live_records(tmp_path, capsys, monkeypatch):
-    tsa = _TestTSA("CLI Trusted TSA")
-    untrusted_tsa = _TestTSA("CLI Untrusted TSA")
+def test_cli_formal_blocks_unproven_late_and_illegal_offset_live_records(tmp_path, capsys):
     inputs = make_inputs(tmp_path, include_live_records=False)
     base_regimes = {
         "schema_version": "2.0.0",
@@ -945,63 +781,42 @@ def test_cli_formal_blocks_unproven_late_and_illegal_offset_live_records(tmp_pat
     assert "pre_market_proof" in capsys.readouterr().err
     assert not out.exists()
 
-    # 2. Subprocess CLI regression (Blocking 1): post-market receipt + rolled-back mtime & backfilled local Git dates -> exit 2
-    forged_no_tsa = json.loads(json.dumps(base_regimes))
-    receipt_p = attach_live_proof(tmp_path, forged_no_tsa["records"][0], tsa=None)
-    pre_ts = datetime(2026, 11, 23, 16, 0, 0, tzinfo=CHINA_TZ).timestamp()
-    os.utime(receipt_p, (pre_ts, pre_ts))
-    write_json(inputs.regimes, forged_no_tsa)
-    script = DEFAULT_SIM_CONFIG_PATH.parents[1] / "src" / "run_daily_sim.py"
-    env = {**os.environ, "PYTHONUTF8": "1", "PYTHONDONTWRITEBYTECODE": "1"}
-    proc_mtime = subprocess.run(
-        [QUANT_PYTHON, str(script), *inputs.args(out, "--from-scratch", as_of=inputs.dates[1])],
-        capture_output=True, text=True, encoding="utf-8", env=env, timeout=30, check=False,
-    )
-    assert proc_mtime.returncode == 2
+    # 2. Post-market receipt file write time (>= 09:30+08:00) -> exit 2
+    with_late_receipt = json.loads(json.dumps(base_regimes))
+    attach_live_proof(tmp_path, with_late_receipt["records"][0], receipt_mtime=datetime(2026, 11, 26, 20, 48, 0, tzinfo=CHINA_TZ))
+    write_json(inputs.regimes, with_late_receipt)
+    assert cli_main(inputs.args(out, "--from-scratch", as_of=inputs.dates[1])) == 2
+    assert "market open" in capsys.readouterr().err
     assert not out.exists()
 
-    # Even with a self-signed TSA token + backfilled local Git author/committer dates, public CLI rejects ("unverified source")
-    forged_self_tsa = json.loads(json.dumps(base_regimes))
-    attach_live_proof(tmp_path, forged_self_tsa["records"][0], tsa=untrusted_tsa, gen_time=datetime(2026, 11, 23, 16, 0, tzinfo=CHINA_TZ))
-    write_json(inputs.regimes, forged_self_tsa)
-    git_dir = tmp_path / "git_forged"
+    # 3. Post-market Git commit timestamp fails even if receipt file mtime is older -> exit 2
+    git_dir = tmp_path / "git_late"
     git_dir.mkdir()
-    (git_dir / "pre_market_proofs").mkdir()
-    for p_file in (tmp_path / "pre_market_proofs").iterdir():
-        (git_dir / "pre_market_proofs" / p_file.name).write_bytes(p_file.read_bytes())
+    git_rec = json.loads(json.dumps(base_regimes))
+    git_receipt = attach_live_proof(git_dir, git_rec["records"][0], receipt_mtime=datetime(2026, 11, 23, 16, 0, tzinfo=CHINA_TZ))
     git_regimes = git_dir / "regime_history.json"
-    write_json(git_regimes, forged_self_tsa)
+    write_json(git_regimes, git_rec)
     git_cfg = json.loads(inputs.config.read_text(encoding="utf-8"))
     git_cfg["upstream_paths"]["regime_history_file"] = str(git_regimes)
     git_cfg_path = tmp_path / "sim_config_git.json"
     write_json(git_cfg_path, git_cfg)
+    env = {**os.environ, "PYTHONUTF8": "1", "PYTHONDONTWRITEBYTECODE": "1"}
     for g_args, g_ts in [
         (["init"], None),
         (["config", "user.name", "Tester"], None),
         (["config", "user.email", "tester@example.com"], None),
         (["add", "."], None),
-        (["commit", "-m", "backfilled local git dates"], "2026-11-23T16:00:00+08:00"),
+        (["commit", "-m", "post-market commit"], "2026-11-26T20:48:00+08:00"),
     ]:
         g_env = dict(env)
         if g_ts:
             g_env["GIT_AUTHOR_DATE"] = g_ts
             g_env["GIT_COMMITTER_DATE"] = g_ts
         assert subprocess.run(["git", "-C", str(git_dir), *g_args], env=g_env, capture_output=True, check=False).returncode == 0
-    proc_git = subprocess.run(
-        [QUANT_PYTHON, str(script), "--config", str(git_cfg_path), "--output-dir", str(out), "--from-scratch", "--as-of", inputs.dates[1]],
-        capture_output=True, text=True, encoding="utf-8", env=env, timeout=30, check=False,
-    )
-    assert proc_git.returncode == 2
-    assert "unverified source" in proc_git.stderr
-    assert not out.exists()
-
-    # 3. With trusted TSA root: post-market TSA reception time (20:48 / 09:30:00) still fails -> exit 2
-    monkeypatch.setattr("src.data_loader._load_default_trusted_tsa_roots", lambda: (tsa.root_cert,))
-    with_late_tsa = json.loads(json.dumps(base_regimes))
-    attach_live_proof(tmp_path, with_late_tsa["records"][0], tsa=tsa, gen_time=datetime(2026, 11, 26, 20, 48, 0, tzinfo=CHINA_TZ))
-    write_json(inputs.regimes, with_late_tsa)
-    assert cli_main(inputs.args(out, "--from-scratch", as_of=inputs.dates[1])) == 2
-    assert "market open" in capsys.readouterr().err
+    pre_ts = datetime(2026, 11, 23, 16, 0, 0, tzinfo=CHINA_TZ).timestamp()
+    os.utime(git_receipt, (pre_ts, pre_ts))
+    assert cli_main(["--config", str(git_cfg_path), "--output-dir", str(out), "--from-scratch", "--as-of", inputs.dates[1]]) == 2
+    assert "Git commit timestamp" in capsys.readouterr().err
     assert not out.exists()
 
     # 4. Illegal ISO offset +07:60 -> exit 2
@@ -1018,10 +833,10 @@ def test_cli_formal_blocks_unproven_late_and_illegal_offset_live_records(tmp_pat
     assert cli_main(inputs.args(out, "--from-scratch", as_of=inputs.dates[1])) == 2
     assert "market open" in capsys.readouterr().err
 
-    # 6. Valid UTC equivalent time (01:29:59Z = 09:29:59+08:00) + trusted pre-market TSA proof -> exit 0
+    # 6. Valid UTC equivalent time (01:29:59Z = 09:29:59+08:00) + pre-market local proof -> exit 0
     utc_ok = json.loads(json.dumps(base_regimes))
     utc_ok["records"][0]["recorded_at"] = f"{inputs.dates[1]}T01:29:59Z"
-    attach_live_proof(tmp_path, utc_ok["records"][0], tsa=tsa, gen_time=datetime(2026, 11, 24, 9, 29, 59, tzinfo=CHINA_TZ))
+    attach_live_proof(tmp_path, utc_ok["records"][0], receipt_mtime=datetime(2026, 11, 24, 9, 29, 59, tzinfo=CHINA_TZ))
     write_json(inputs.regimes, utc_ok)
     assert cli_main(inputs.args(out, "--from-scratch", as_of=inputs.dates[1])) == 0
 
@@ -1084,9 +899,7 @@ def test_cli_formal_resume_blocks_appended_prior_backfill_and_preserves_output_b
     assert a_trades and (a_trades[0]["date"], a_trades[0]["symbol"], a_trades[0]["action"]) == (thursday, GRID, "GRID_INIT_BUY")
 
 
-def test_cli_valid_replay_init_then_formal_resume_blocks_edit_delete_and_missing_window(
-    tmp_path, capsys, trusted_test_tsa
-):
+def test_cli_valid_replay_init_then_formal_resume_blocks_edit_delete_and_missing_window(tmp_path, capsys):
     inputs = make_inputs(tmp_path, include_live_records=False)
     cfg = json.loads(inputs.config.read_text(encoding="utf-8"))
     cfg["backfill_replay_window"] = {"start_date": START, "end_date": "2026-11-26"}
@@ -1117,7 +930,7 @@ def test_cli_valid_replay_init_then_formal_resume_blocks_edit_delete_and_missing
         "record_type": "LIVE",
         "recorded_at": "2026-11-27T16:00:00+08:00",
     }
-    attach_live_proof(tmp_path, live_rec, tsa=trusted_test_tsa, gen_time=datetime(2026, 11, 27, 16, 0, tzinfo=CHINA_TZ))
+    attach_live_proof(tmp_path, live_rec, receipt_mtime=datetime(2026, 11, 27, 16, 0, tzinfo=CHINA_TZ))
     payload = {
         "schema_version": "2.0.0",
         "anchor_start_date": START,

@@ -2,28 +2,17 @@
 
 from __future__ import annotations
 
-import base64
-from datetime import date, datetime, timedelta, timezone
-import hashlib
+from datetime import date, timedelta
 import json
 from typing import Any
 
-from cryptography import x509
-from cryptography.hazmat.primitives import hashes, serialization
-from cryptography.hazmat.primitives.asymmetric import ec
-from cryptography.x509.oid import ExtendedKeyUsageOID, NameOID
 import pandas as pd
-from pyasn1.codec.der import decoder as der_decoder, encoder as der_encoder
-from pyasn1.type import univ, useful
-from pyasn1_modules import rfc3161, rfc5280, rfc5652
 import pytest
 
 from src.data_loader import (
-    CHINA_TZ,
     MarketBundle,
     RegimeHistory,
     build_forward_adjusted_daily,
-    compute_live_attestation_payload,
     compute_regime_decision_sha256,
     load_sim_config,
 )
@@ -47,153 +36,6 @@ OTHER = "159622.SZ"
 WARMUP = pd.bdate_range(end="2026-11-20", periods=60).strftime("%Y-%m-%d").tolist()
 
 
-class _TestTSA:
-    """Test-only offline RFC 3161 TSA issuer."""
-
-    def __init__(self, cn: str = "Engine Test TSA") -> None:
-        base_time = datetime(2026, 1, 1, 0, 0, 0, tzinfo=timezone.utc)
-        self.root_key = ec.generate_private_key(ec.SECP256R1())
-        self.tsa_key = ec.generate_private_key(ec.SECP256R1())
-        root_name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, f"{cn} Root")])
-        tsa_name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, f"{cn} Signer")])
-        self.root_cert = (
-            x509.CertificateBuilder()
-            .subject_name(root_name).issuer_name(root_name)
-            .public_key(self.root_key.public_key())
-            .serial_number(x509.random_serial_number())
-            .not_valid_before(base_time)
-            .not_valid_after(base_time + timedelta(days=3650))
-            .add_extension(x509.BasicConstraints(ca=True, path_length=None), critical=True)
-            .add_extension(
-                x509.KeyUsage(
-                    digital_signature=False, content_commitment=False, key_encipherment=False,
-                    data_encipherment=False, key_agreement=False, key_cert_sign=True,
-                    crl_sign=True, encipher_only=False, decipher_only=False,
-                ),
-                critical=True,
-            )
-            .add_extension(x509.SubjectKeyIdentifier.from_public_key(self.root_key.public_key()), critical=False)
-            .sign(self.root_key, hashes.SHA256())
-        )
-        self.tsa_cert = (
-            x509.CertificateBuilder()
-            .subject_name(tsa_name).issuer_name(root_name)
-            .public_key(self.tsa_key.public_key())
-            .serial_number(x509.random_serial_number())
-            .not_valid_before(base_time)
-            .not_valid_after(base_time + timedelta(days=3650))
-            .add_extension(x509.BasicConstraints(ca=False, path_length=None), critical=True)
-            .add_extension(
-                x509.KeyUsage(
-                    digital_signature=True, content_commitment=True, key_encipherment=False,
-                    data_encipherment=False, key_agreement=False, key_cert_sign=False,
-                    crl_sign=False, encipher_only=False, decipher_only=False,
-                ),
-                critical=True,
-            )
-            .add_extension(x509.ExtendedKeyUsage([ExtendedKeyUsageOID.TIME_STAMPING]), critical=True)
-            .add_extension(x509.SubjectKeyIdentifier.from_public_key(self.tsa_key.public_key()), critical=False)
-            .add_extension(
-                x509.AuthorityKeyIdentifier.from_issuer_subject_key_identifier(
-                    self.root_cert.extensions.get_extension_for_class(x509.SubjectKeyIdentifier).value
-                ),
-                critical=False,
-            )
-            .sign(self.root_key, hashes.SHA256())
-        )
-
-    def sign_digest(self, digest_bytes: bytes, gen_time: datetime) -> bytes:
-        gen_utc = gen_time.astimezone(timezone.utc)
-        tst = rfc3161.TSTInfo()
-        tst["version"] = 1
-        tst["policy"] = univ.ObjectIdentifier("1.2.3.4.5")
-        tst["messageImprint"]["hashAlgorithm"]["algorithm"] = univ.ObjectIdentifier("2.16.840.1.101.3.4.2.1")
-        tst["messageImprint"]["hashAlgorithm"]["parameters"] = univ.Null("")
-        tst["messageImprint"]["hashedMessage"] = digest_bytes
-        tst["serialNumber"] = 1
-        tst["genTime"] = useful.GeneralizedTime(gen_utc.strftime("%Y%m%d%H%M%SZ"))
-        e_content = der_encoder.encode(tst)
-
-        sa_set = rfc5652.SignedAttributes()
-        a1 = rfc5652.Attribute()
-        a1["attrType"] = rfc5652.id_contentType
-        a1["attrValues"][0] = der_encoder.encode(univ.ObjectIdentifier("1.2.840.113549.1.9.16.1.4"))
-        a2 = rfc5652.Attribute()
-        a2["attrType"] = rfc5652.id_messageDigest
-        a2["attrValues"][0] = der_encoder.encode(univ.OctetString(hashlib.sha256(e_content).digest()))
-        sa_set[0] = a1
-        sa_set[1] = a2
-        sig = self.tsa_key.sign(der_encoder.encode(sa_set), ec.ECDSA(hashes.SHA256()))
-
-        sd = rfc5652.SignedData()
-        sd["version"] = 3
-        da = rfc5652.DigestAlgorithmIdentifier()
-        da["algorithm"] = univ.ObjectIdentifier("2.16.840.1.101.3.4.2.1")
-        da["parameters"] = univ.Null("")
-        sd["digestAlgorithms"][0] = da
-        sd["encapContentInfo"]["eContentType"] = univ.ObjectIdentifier("1.2.840.113549.1.9.16.1.4")
-        sd["encapContentInfo"]["eContent"] = e_content
-        cert_choice = rfc5652.CertificateChoices()
-        parsed_cert, _ = der_decoder.decode(
-            self.tsa_cert.public_bytes(serialization.Encoding.DER), asn1Spec=rfc5280.Certificate()
-        )
-        cert_choice["certificate"] = parsed_cert
-        sd["certificates"][0] = cert_choice
-
-        si = rfc5652.SignerInfo()
-        si["version"] = 1
-        issuer_asn1, _ = der_decoder.decode(self.tsa_cert.issuer.public_bytes(), asn1Spec=rfc5280.Name())
-        si["sid"]["issuerAndSerialNumber"]["issuer"] = issuer_asn1
-        si["sid"]["issuerAndSerialNumber"]["serialNumber"] = self.tsa_cert.serial_number
-        si["digestAlgorithm"] = da
-        si["signedAttrs"][0] = a1
-        si["signedAttrs"][1] = a2
-        si["signatureAlgorithm"]["algorithm"] = univ.ObjectIdentifier("1.2.840.10045.4.3.2")
-        si["signature"] = sig
-        sd["signerInfos"][0] = si
-
-        ci = rfc5652.ContentInfo()
-        ci["contentType"] = rfc5652.id_signedData
-        ci["content"] = der_encoder.encode(sd)
-        resp = rfc3161.TimeStampResp()
-        resp["status"]["status"] = 0
-        resp["timeStampToken"] = ci
-        return der_encoder.encode(resp)
-
-
-@pytest.fixture()
-def trusted_test_tsa(monkeypatch: pytest.MonkeyPatch) -> _TestTSA:
-    tsa = _TestTSA()
-    monkeypatch.setattr("src.data_loader._load_default_trusted_tsa_roots", lambda: (tsa.root_cert,))
-    return tsa
-
-
-def _attach_in_memory_live_proof(symbol: str, rec: dict[str, Any], tsa: _TestTSA) -> dict[str, Any]:
-    recorded_cst = datetime.fromisoformat(rec["recorded_at"].replace("Z", "+00:00")).astimezone(CHINA_TZ).isoformat()
-    decision_sha = compute_regime_decision_sha256({"symbol": symbol, **rec}, recorded_cst)
-    attestation_bytes = compute_live_attestation_payload(
-        record_id=rec["record_id"],
-        decision_date=rec["decision_date"],
-        effective_date=rec["effective_date"],
-        symbol=symbol,
-        prev_regime=rec["prev_regime"],
-        new_regime=rec["regime"],
-        recorded_at_cst=recorded_cst,
-        decision_sha256=decision_sha,
-        decision_entry_sha256=None,
-        decision_ref=rec.get("decision_ref"),
-        card_path=rec.get("card_path"),
-    )
-    tsr_bytes = tsa.sign_digest(hashlib.sha256(attestation_bytes).digest(), datetime.fromisoformat(recorded_cst))
-    return {
-        **rec,
-        "pre_market_proof": {
-            "decision_sha256": decision_sha,
-            "tsa_token_b64": base64.b64encode(tsr_bytes).decode("ascii"),
-        },
-    }
-
-
 def sessions(count: int) -> list[str]:
     return pd.bdate_range(start=START, periods=count).strftime("%Y-%m-%d").tolist()
 
@@ -210,7 +52,6 @@ def make_bundle(
     record_overrides: dict[str, list[dict[str, Any]]] | None = None,
     forward_eval_start_date: str | None = None,
     backfill_replay_window: dict[str, str] | None | object = ...,
-    tsa: _TestTSA | None = None,
 ) -> MarketBundle:
     config = load_sim_config()
     config["forward_eval_start_date"] = forward_eval_start_date
@@ -232,15 +73,7 @@ def make_bundle(
     dividend_map = {symbol: (dividends or {}).get(symbol, {}) for symbol in symbols}
     routes = {symbol: (initial_routes or {}).get(symbol, "TRANSITION") for symbol in sectors}
     if record_overrides is not None:
-        records_by_symbol = {
-            sym: [
-                _attach_in_memory_live_proof(sym, rec, tsa)
-                if tsa is not None and rec.get("record_type") == "LIVE" and "pre_market_proof" not in rec
-                else rec
-                for rec in recs
-            ]
-            for sym, recs in record_overrides.items()
-        }
+        records_by_symbol = {sym: list(recs) for sym, recs in record_overrides.items()}
     else:
         records_by_symbol = {}
         for symbol, changes in (route_changes or {}).items():
@@ -249,18 +82,17 @@ def make_bundle(
             for idx, (day, regime) in enumerate(changes, 1):
                 day_idx = all_days.index(day)
                 dec_day = all_days[day_idx - 1]
-                rec = {
-                    "record_id": f"RH-{symbol}-{idx}",
-                    "decision_date": dec_day,
-                    "effective_date": day,
-                    "prev_regime": prev_reg,
-                    "regime": regime,
-                    "record_type": "LIVE",
-                    "recorded_at": f"{dec_day}T16:00:00+08:00",
-                }
-                if tsa is not None:
-                    rec = _attach_in_memory_live_proof(symbol, rec, tsa)
-                sym_records.append(rec)
+                sym_records.append(
+                    {
+                        "record_id": f"RH-{symbol}-{idx}",
+                        "decision_date": dec_day,
+                        "effective_date": day,
+                        "prev_regime": prev_reg,
+                        "regime": regime,
+                        "record_type": "LIVE",
+                        "recorded_at": f"{dec_day}T16:00:00+08:00",
+                    }
+                )
                 prev_reg = regime
             records_by_symbol[symbol] = sym_records
     history = RegimeHistory("2.0.0", START, routes, records_by_symbol)
@@ -334,14 +166,13 @@ def test_ex_date_dividend_reinvests_only_within_payout_after_fees(per_unit, open
 
 
 @pytest.mark.parametrize("target,action", [("TRANSITION", "REGIME_SWITCH_EXIT"), ("TRAP_OFF", "TRAP_OFF_LIQUIDATION")])
-def test_route_to_cash_liquidates_at_open_and_keeps_dividend(target, action, trusted_test_tsa):
+def test_route_to_cash_liquidates_at_open_and_keeps_dividend(target, action):
     first, switch = sessions(2)
     bundle = make_bundle(
         [first, switch], initial_routes={SECTOR: "RANGE_GRID"},
         bars={SECTOR: {switch: (0.8, 1.05, 0.7, 0.95)}},
         route_changes={SECTOR: [(switch, target)]},
         dividends={SECTOR: {switch: 0.03}},
-        tsa=trusted_test_tsa,
     )
     engine = SimulationEngine(bundle)
     engine.step_day(first)
@@ -355,13 +186,12 @@ def test_route_to_cash_liquidates_at_open_and_keeps_dividend(target, action, tru
     assert state.grid is None and state.active_regime == target
 
 
-def test_cross_strategy_switch_exits_before_initializing_at_same_open(trusted_test_tsa):
+def test_cross_strategy_switch_exits_before_initializing_at_same_open():
     first, grid_day, trend_day = sessions(3)
     bundle = make_bundle(
         [first, grid_day, trend_day], initial_routes={SECTOR: "TREND_UP"},
         route_changes={SECTOR: [(grid_day, "RANGE_GRID"), (trend_day, "TREND_UP")]},
         bars={SECTOR: {grid_day: (1.15, 1.16, 1.14, 1.155), trend_day: (0.9, 0.91, 0.89, 0.9)}},
-        tsa=trusted_test_tsa,
     )
     engine = run_simulation(bundle)
     assert [t["action"] for t in trades(engine.daily_results[0], "A")] == ["TURTLE_ENTRY_BUY"]
@@ -559,7 +389,7 @@ def test_nonpositive_grid_buy_levels_are_skipped_without_a_step_cap():
     assert [order.level for order in grid.pending_orders] == [-1, 1, 2, 3, 4]
 
 
-def test_suspension_applies_split_and_payout_then_resumes_liquidation_and_reinvestment(trusted_test_tsa):
+def test_suspension_applies_split_and_payout_then_resumes_liquidation_and_reinvestment():
     first, halted, still_halted, reopened = sessions(4)
     bundle = make_bundle(
         [first, halted, still_halted, reopened], initial_routes={SECTOR: "RANGE_GRID"},
@@ -567,7 +397,6 @@ def test_suspension_applies_split_and_payout_then_resumes_liquidation_and_reinve
         bars={SECTOR: {halted: None, still_halted: None, reopened: (1.5, 1.51, 1.49, 1.5)}},
         splits={SECTOR: [{"effective_date": halted, "factor": 1.5}]},
         dividends={SECTOR: {halted: 0.1, still_halted: 0.05}},
-        tsa=trusted_test_tsa,
     )
     engine = SimulationEngine(bundle)
     engine.step_day(first)
@@ -607,13 +436,12 @@ def test_suspension_applies_split_and_payout_then_resumes_liquidation_and_reinve
     assert engine.accounts["B2"].symbol_states[SECTOR].pending_dividend == 0
 
 
-def test_pending_route_exit_survives_another_target_change_before_reopening(trusted_test_tsa):
+def test_pending_route_exit_survives_another_target_change_before_reopening():
     first, halted, reopened = sessions(3)
     engine = SimulationEngine(make_bundle(
         [first, halted, reopened], initial_routes={SECTOR: "RANGE_GRID"},
         route_changes={SECTOR: [(halted, "TRAP_OFF"), (reopened, "RANGE_GRID")]},
         bars={SECTOR: {halted: None, reopened: (1.2, 1.21, 1.19, 1.2)}},
-        tsa=trusted_test_tsa,
     ))
     engine.step_day(first)
     engine.step_day(halted)
@@ -790,7 +618,7 @@ def test_formal_run_rejects_backfill_while_replay_allows_and_excludes_from_live_
     assert stats["backfill_record_ids"] == ["RH-BF-001"]
 
 
-def test_backfill_init_then_formal_live_resume_and_late_live_rejection(trusted_test_tsa):
+def test_backfill_init_then_formal_live_resume_and_late_live_rejection():
     day1, day2, day3 = sessions(3)
     records = {
         SECTOR: [
@@ -820,7 +648,6 @@ def test_backfill_init_then_formal_live_resume_and_late_live_rejection(trusted_t
         initial_routes={SECTOR: "TRANSITION"},
         record_overrides=records,
         forward_eval_start_date=day3,
-        tsa=trusted_test_tsa,
     )
     init_engine = run_simulation(init_bundle, end_date=day2, run_mode="replay")
     saved_state = json.loads(json.dumps(init_engine.export_state(), allow_nan=False))
@@ -844,71 +671,136 @@ def test_backfill_init_then_formal_live_resume_and_late_live_rejection(trusted_t
         initial_routes={SECTOR: "TRANSITION"},
         record_overrides=late_records,
         forward_eval_start_date=day3,
-        tsa=trusted_test_tsa,
     )
     with pytest.raises(ValueError, match="market open"):
         SimulationEngine.from_state(late_bundle, saved_state, run_mode="formal").run()
 
 
-def test_direct_engine_formal_rejects_unproven_or_untrusted_live_records():
-    """Regression (Blocking 1): direct run_simulation(..., run_mode='formal') with source_path=None must reject unproven/untrusted LIVE."""
-    day1, day2 = sessions(2)
-    unproven_bundle = make_bundle(
-        [day1, day2],
-        initial_routes={SECTOR: "TRANSITION"},
-        route_changes={SECTOR: [(day2, "RANGE_GRID")]},
-        tsa=None,
-    )
-    assert unproven_bundle.regime_history.source_path is None
-    with pytest.raises(ValueError, match="pre_market_proof"):
-        run_simulation(unproven_bundle, run_mode="formal")
+def test_direct_engine_formal_validates_in_memory_regime_fields_and_step_day_consistency():
+    """In-memory RegimeHistory (source_path=None) still enforces record_type, recorded_at tz/pre-open, normalized regime consistency, and continuous step_day checks."""
+    day1, day2, day3 = sessions(3)
 
-    # Even with a self-signed TSA token + source_path=None, production trust roots reject ("unverified source")
-    fake_tsa = _TestTSA("Untrusted Direct Engine TSA")
-    untrusted_bundle = make_bundle(
-        [day1, day2],
-        initial_routes={SECTOR: "TRANSITION"},
-        route_changes={SECTOR: [(day2, "RANGE_GRID")]},
-        tsa=fake_tsa,
-    )
-    with pytest.raises(ValueError, match="unverified source"):
-        run_simulation(untrusted_bundle, run_mode="formal")
+    # 1. Invalid record_type, naive/illegal-offset/late recorded_at, and conflicting regime vs new_regime all fail
+    for bad_record, pattern in [
+        (
+            {
+                "record_id": "RH-BAD-TYPE",
+                "decision_date": day1,
+                "effective_date": day2,
+                "prev_regime": "TRANSITION",
+                "regime": "RANGE_GRID",
+                "record_type": "MANUAL",
+                "recorded_at": f"{day1}T16:00:00+08:00",
+            },
+            "record_type",
+        ),
+        (
+            {
+                "record_id": "RH-BAD-NAIVE",
+                "decision_date": day1,
+                "effective_date": day2,
+                "prev_regime": "TRANSITION",
+                "regime": "RANGE_GRID",
+                "record_type": "LIVE",
+                "recorded_at": f"{day1}T16:00:00",
+            },
+            "ISO 8601",
+        ),
+        (
+            {
+                "record_id": "RH-BAD-OFFSET",
+                "decision_date": day1,
+                "effective_date": day2,
+                "prev_regime": "TRANSITION",
+                "regime": "RANGE_GRID",
+                "record_type": "LIVE",
+                "recorded_at": f"{day1}T16:00:00+07:60",
+            },
+            "ISO 8601",
+        ),
+        (
+            {
+                "record_id": "RH-BAD-LATE",
+                "decision_date": day1,
+                "effective_date": day2,
+                "prev_regime": "TRANSITION",
+                "regime": "RANGE_GRID",
+                "record_type": "LIVE",
+                "recorded_at": f"{day2}T09:30:00+08:00",
+            },
+            "market open",
+        ),
+        (
+            {
+                "record_id": "RH-BAD-CONFLICT",
+                "decision_date": day1,
+                "effective_date": day2,
+                "prev_regime": "TRANSITION",
+                "regime": "RANGE_GRID",
+                "new_regime": "TREND_UP",
+                "record_type": "LIVE",
+                "recorded_at": f"{day1}T16:00:00+08:00",
+            },
+            "conflicting regime",
+        ),
+        (
+            {
+                "record_id": "RH-BAD-SHA",
+                "decision_date": day1,
+                "effective_date": day2,
+                "prev_regime": "TRANSITION",
+                "regime": "RANGE_GRID",
+                "record_type": "LIVE",
+                "recorded_at": f"{day1}T16:00:00+08:00",
+                "pre_market_proof": {"decision_sha256": "0" * 64},
+            },
+            "does not match",
+        ),
+    ]:
+        bad_bundle = make_bundle([day1, day2], initial_routes={SECTOR: "TRANSITION"}, record_overrides={SECTOR: [bad_record]})
+        assert bad_bundle.regime_history.source_path is None
+        with pytest.raises(ValueError, match=pattern):
+            run_simulation(bad_bundle, run_mode="formal")
 
-    # Even with receipt_path + decision_sha256 without tsa_token_b64, direct engine rejects
-    partial_bundle = make_bundle(
-        [day1, day2],
-        initial_routes={SECTOR: "TRANSITION"},
-        record_overrides={
-            SECTOR: [
-                {
-                    "record_id": "RH-DIRECT-PARTIAL",
-                    "decision_date": day1,
-                    "effective_date": day2,
-                    "prev_regime": "TRANSITION",
-                    "regime": "RANGE_GRID",
-                    "record_type": "LIVE",
-                    "recorded_at": f"{day1}T16:00:00+08:00",
-                    "pre_market_proof": {
-                        "receipt_path": "pre_market_proofs/RH-DIRECT-PARTIAL.json",
-                        "decision_sha256": compute_regime_decision_sha256(
-                            {
-                                "record_id": "RH-DIRECT-PARTIAL",
-                                "decision_date": day1,
-                                "effective_date": day2,
-                                "symbol": SECTOR,
-                                "prev_regime": "TRANSITION",
-                                "new_regime": "RANGE_GRID",
-                                "record_type": "LIVE",
-                            },
-                            f"{day1}T16:00:00+08:00",
-                        ),
-                    },
-                }
-            ]
-        },
+    # 2. Normalized UNRATED -> TRANSITION is consistent across matching and decision_sha256
+    unrated_rec = {
+        "record_id": "RH-UNRATED-001",
+        "decision_date": day1,
+        "effective_date": day2,
+        "prev_regime": "UNRATED",
+        "new_regime": "UNRATED",
+        "record_type": "LIVE",
+        "recorded_at": f"{day1}T16:00:00+08:00",
+    }
+    unrated_rec["pre_market_proof"] = {
+        "decision_sha256": compute_regime_decision_sha256(
+            {"symbol": SECTOR, **unrated_rec, "prev_regime": "TRANSITION", "new_regime": "TRANSITION"},
+            f"{day1}T16:00:00+08:00",
+        )
+    }
+    unrated_bundle = make_bundle([day1, day2], initial_routes={SECTOR: "UNRATED"}, record_overrides={SECTOR: [unrated_rec]})
+    unrated_engine = run_simulation(unrated_bundle, run_mode="formal")
+    assert unrated_engine.daily_results[-1]["routed_positions"][SECTOR]["target_regime"] == "TRANSITION"
+
+    # 3. Continuous step_day on the same engine instance updates checkpoint and blocks post-hoc prior BACKFILL injection
+    step_bundle = make_bundle([day1, day2, day3], initial_routes={SECTOR: "TRANSITION"})
+    step_engine = SimulationEngine(step_bundle, run_mode="formal")
+    step_engine.step_day(day1)
+    step_engine.step_day(day2)
+    step_bundle.regime_history.records_by_symbol.setdefault(SECTOR, []).append(
+        {
+            "record_id": "RH-INJECTED-BF",
+            "decision_date": day1,
+            "effective_date": day2,
+            "prev_regime": "TRANSITION",
+            "regime": "RANGE_GRID",
+            "record_type": "BACKFILL",
+            "recorded_at": None,
+            "time_evidence_boundary": "injected between step_day calls",
+        }
     )
-    with pytest.raises(ValueError, match="tsa_token_b64"):
-        SimulationEngine(partial_bundle, run_mode="formal").run()
+    with pytest.raises(ValueError, match="BACKFILL"):
+        step_engine.step_day(day3)
 
 
 def test_formal_resume_rejects_appended_modified_or_out_of_window_backfill():

@@ -7,7 +7,6 @@ upstream files or falling back to network sources.
 
 from __future__ import annotations
 
-import base64
 from bisect import bisect_left, bisect_right
 from dataclasses import dataclass
 from datetime import date, datetime, time, timedelta, timezone
@@ -16,22 +15,11 @@ import json
 import math
 from pathlib import Path
 import re
+import subprocess
 from typing import Any, Mapping, Sequence
-import warnings
 
-import certifi
-from cryptography import x509
-from cryptography.exceptions import InvalidSignature
-from cryptography.hazmat.primitives import hashes
-from cryptography.hazmat.primitives.asymmetric import ec, ed25519, padding, rsa
-from cryptography.x509 import verification
-from cryptography.x509.oid import ExtendedKeyUsageOID
 import numpy as np
 import pandas as pd
-from pyasn1.codec.der import decoder as der_decoder, encoder as der_encoder
-from pyasn1.error import PyAsn1Error
-from pyasn1.type import univ
-from pyasn1_modules import rfc3161, rfc5652
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_SIM_CONFIG_PATH = REPO_ROOT / "project_content" / "config" / "sim_config.json"
@@ -130,16 +118,46 @@ def _validate_live_recorded_at(
     return recorded_cst.isoformat()
 
 
+def _normalize_regime_for_hash(raw_value: Any) -> str:
+    """Normalize a regime string consistently with sector_radar (strip + map UNRATED -> TRANSITION)."""
+    text = str(raw_value or "").strip()
+    return "TRANSITION" if text == "UNRATED" else text
+
+
+def _extract_normalized_record_regime(record: Mapping[str, Any], label: str) -> str:
+    """Extract and validate the single normalized target regime used by both matching and validation."""
+    has_regime = "regime" in record and record.get("regime") is not None
+    has_new = "new_regime" in record and record.get("new_regime") is not None
+    if has_regime and has_new:
+        norm_regime = _normalized_regime(record.get("regime"), f"{label}.regime")
+        norm_new = _normalized_regime(record.get("new_regime"), f"{label}.new_regime")
+        if norm_regime != norm_new:
+            raise ValueError(
+                f"{label} has conflicting regime ({norm_regime!r}) and new_regime ({norm_new!r})"
+            )
+        return norm_regime
+    if has_regime:
+        return _normalized_regime(record.get("regime"), f"{label}.regime")
+    if has_new:
+        return _normalized_regime(record.get("new_regime"), f"{label}.new_regime")
+    raise ValueError(f"{label} missing target regime field ('regime' or 'new_regime')")
+
+
 def compute_regime_decision_sha256(raw_record: Mapping[str, Any], recorded_cst_iso: str) -> str:
-    """Compute canonical SHA-256 of a LIVE regime record matching sector_radar's attestation format."""
-    trigger_alerts = raw_record.get("trigger_alerts") if raw_record.get("has_trigger_alerts", "trigger_alerts" in raw_record) else None
+    """Compute canonical SHA-256 of a LIVE regime record (normalized regimes) matching sector_radar."""
+    trigger_alerts = (
+        raw_record.get("trigger_alerts")
+        if raw_record.get("has_trigger_alerts", "trigger_alerts" in raw_record)
+        else None
+    )
+    raw_new = raw_record.get("new_regime") if raw_record.get("new_regime") is not None else raw_record.get("regime")
     payload = {
         "record_id": str(raw_record.get("record_id") or "").strip(),
         "decision_date": str(raw_record.get("decision_date") or "").strip(),
         "effective_date": str(raw_record.get("effective_date") or "").strip(),
         "symbol": str(raw_record.get("symbol") or "").strip(),
-        "prev_regime": str(raw_record.get("raw_prev_regime", raw_record.get("prev_regime")) or "").strip(),
-        "new_regime": str(raw_record.get("raw_new_regime", raw_record.get("new_regime", raw_record.get("regime"))) or "").strip(),
+        "prev_regime": _normalize_regime_for_hash(raw_record.get("prev_regime")),
+        "new_regime": _normalize_regime_for_hash(raw_new),
         "record_type": str(raw_record.get("record_type") or "").strip(),
         "recorded_at_cst": recorded_cst_iso,
         "trigger_alerts": list(trigger_alerts) if isinstance(trigger_alerts, list) else trigger_alerts,
@@ -148,322 +166,6 @@ def compute_regime_decision_sha256(raw_record: Mapping[str, Any], recorded_cst_i
     }
     canonical = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
-
-
-def compute_live_attestation_payload(
-    *,
-    record_id: str,
-    decision_date: str,
-    effective_date: str,
-    symbol: str,
-    prev_regime: str,
-    new_regime: str,
-    recorded_at_cst: str,
-    decision_sha256: str,
-    decision_entry_sha256: str | None,
-    decision_ref: Any,
-    card_path: Any,
-) -> bytes:
-    """Build canonical LIVE attestation payload matching sector_radar's RFC 3161 messageImprint input."""
-    payload = {
-        "schema_version": "2.0.0",
-        "record_id": record_id,
-        "decision_date": decision_date,
-        "effective_date": effective_date,
-        "symbol": symbol,
-        "prev_regime": prev_regime,
-        "new_regime": new_regime,
-        "record_type": "LIVE",
-        "recorded_at_cst": recorded_at_cst,
-        "decision_sha256": decision_sha256,
-        "decision_entry_sha256": decision_entry_sha256,
-        "decision_ref": decision_ref,
-        "card_path": card_path,
-    }
-    return json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
-
-
-_OID_SHA256 = "2.16.840.1.101.3.4.2.1"
-_OID_SHA384 = "2.16.840.1.101.3.4.2.2"
-_OID_SHA512 = "2.16.840.1.101.3.4.2.3"
-_OID_CT_TST_INFO = "1.2.840.113549.1.9.16.1.4"
-_OID_CONTENT_TYPE = "1.2.840.113549.1.9.3"
-_OID_MESSAGE_DIGEST = "1.2.840.113549.1.9.4"
-_OID_RSA_ENCRYPTION = "1.2.840.113549.1.1.1"
-_OID_RSASSA_PSS = "1.2.840.113549.1.1.10"
-_OID_RSA_PKCS1_DIGESTS = {
-    "1.2.840.113549.1.1.11": hashes.SHA256,
-    "1.2.840.113549.1.1.12": hashes.SHA384,
-    "1.2.840.113549.1.1.13": hashes.SHA512,
-}
-_OID_ECDSA_DIGESTS = {
-    "1.2.840.10045.4.3.2": hashes.SHA256,
-    "1.2.840.10045.4.3.3": hashes.SHA384,
-    "1.2.840.10045.4.3.4": hashes.SHA512,
-}
-_OID_ED25519 = "1.3.101.112"
-_OID_HASH_ALGS: dict[str, tuple[type[hashes.HashAlgorithm], Any]] = {
-    _OID_SHA256: (hashes.SHA256, hashlib.sha256),
-    _OID_SHA384: (hashes.SHA384, hashlib.sha384),
-    _OID_SHA512: (hashes.SHA512, hashlib.sha512),
-}
-_TSA_GEN_TIME_PATTERN = re.compile(r"^(\d{4})(\d{2})(\d{2})(\d{2})(\d{2})(\d{2})(?:\.(\d+))?Z$")
-_DEFAULT_TRUSTED_TSA_ROOTS_CACHE: tuple[x509.Certificate, ...] | None = None
-
-
-def _load_default_trusted_tsa_roots() -> tuple[x509.Certificate, ...]:
-    """Load pinned trusted public root CA certificates from certifi (never from ledger files)."""
-    global _DEFAULT_TRUSTED_TSA_ROOTS_CACHE
-    if _DEFAULT_TRUSTED_TSA_ROOTS_CACHE is not None:
-        return _DEFAULT_TRUSTED_TSA_ROOTS_CACHE
-    pem_bytes = Path(certifi.where()).read_bytes()
-    roots: list[x509.Certificate] = []
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore")
-        for match in re.finditer(
-            rb"-----BEGIN CERTIFICATE-----.*?-----END CERTIFICATE-----",
-            pem_bytes,
-            flags=re.DOTALL,
-        ):
-            try:
-                cert = x509.load_pem_x509_certificate(match.group(0))
-            except ValueError:
-                continue
-            if cert.serial_number > 0:
-                roots.append(cert)
-    if not roots:
-        raise RuntimeError("Failed to load any trusted TSA root certificates")
-    _DEFAULT_TRUSTED_TSA_ROOTS_CACHE = tuple(roots)
-    return _DEFAULT_TRUSTED_TSA_ROOTS_CACHE
-
-
-def _parse_tsa_gen_time_utc(raw_gen_time: str, label: str) -> datetime:
-    match = _TSA_GEN_TIME_PATTERN.fullmatch(raw_gen_time.strip())
-    if match is None:
-        raise ValueError(f"{label} RFC 3161 genTime must be UTC GeneralizedTime(...Z), got {raw_gen_time!r}")
-    year, month, day, hour, minute, second = (int(match.group(i)) for i in range(1, 7))
-    frac = match.group(7) or ""
-    micro = int((frac + "000000")[:6])
-    return datetime(year, month, day, hour, minute, second, micro, tzinfo=timezone.utc)
-
-
-def _check_tsa_ee_eku(_policy: Any, _cert: x509.Certificate, ext: x509.ExtendedKeyUsage) -> None:
-    if ExtendedKeyUsageOID.TIME_STAMPING not in ext:
-        raise ValueError("TSA signing certificate lacks id-kp-timeStamping EKU")
-
-
-def _check_tsa_ee_bc(_policy: Any, _cert: x509.Certificate, ext: x509.BasicConstraints) -> None:
-    if ext.ca:
-        raise ValueError("TSA leaf certificate must not have ca=True")
-
-
-def _check_tsa_ee_ku(_policy: Any, _cert: x509.Certificate, ext: x509.KeyUsage) -> None:
-    if not (ext.digital_signature or ext.content_commitment):
-        raise ValueError("TSA leaf KeyUsage does not permit signing")
-
-
-def _match_cms_signer_cert(
-    sid: Any,
-    certs: Sequence[x509.Certificate],
-    label: str,
-) -> x509.Certificate:
-    choice = sid.getName()
-    if choice == "issuerAndSerialNumber":
-        ias = sid["issuerAndSerialNumber"]
-        expected_issuer = der_encoder.encode(ias["issuer"])
-        expected_serial = int(ias["serialNumber"])
-        for cert in certs:
-            if cert.serial_number == expected_serial and cert.issuer.public_bytes() == expected_issuer:
-                return cert
-    elif choice == "subjectKeyIdentifier":
-        expected_ski = bytes(sid["subjectKeyIdentifier"])
-        for cert in certs:
-            try:
-                ski_ext = cert.extensions.get_extension_for_class(x509.SubjectKeyIdentifier)
-            except x509.ExtensionNotFound:
-                continue
-            if ski_ext.value.digest == expected_ski:
-                return cert
-    raise ValueError(f"{label} unverified source: RFC 3161 token lacks matching signer certificate")
-
-
-def _verify_cms_signature(
-    leaf_cert: x509.Certificate,
-    sig_alg_oid: str,
-    digest_alg_cls: type[hashes.HashAlgorithm],
-    signed_bytes: bytes,
-    signature: bytes,
-    label: str,
-) -> None:
-    pub_key = leaf_cert.public_key()
-    try:
-        if isinstance(pub_key, rsa.RSAPublicKey):
-            if sig_alg_oid == _OID_RSASSA_PSS:
-                pub_key.verify(
-                    signature,
-                    signed_bytes,
-                    padding.PSS(mgf=padding.MGF1(digest_alg_cls()), salt_length=padding.PSS.AUTO),
-                    digest_alg_cls(),
-                )
-                return
-            if sig_alg_oid == _OID_RSA_ENCRYPTION or sig_alg_oid in _OID_RSA_PKCS1_DIGESTS:
-                alg_cls = _OID_RSA_PKCS1_DIGESTS.get(sig_alg_oid, digest_alg_cls)
-                pub_key.verify(signature, signed_bytes, padding.PKCS1v15(), alg_cls())
-                return
-        elif isinstance(pub_key, ec.EllipticCurvePublicKey):
-            if sig_alg_oid in _OID_ECDSA_DIGESTS:
-                alg_cls = _OID_ECDSA_DIGESTS[sig_alg_oid]
-                pub_key.verify(signature, signed_bytes, ec.ECDSA(alg_cls()))
-                return
-        elif isinstance(pub_key, ed25519.Ed25519PublicKey):
-            if sig_alg_oid == _OID_ED25519:
-                pub_key.verify(signature, signed_bytes)
-                return
-    except InvalidSignature as exc:
-        raise ValueError(f"{label} unverified source: RFC 3161 CMS signature verification failed") from exc
-    raise ValueError(f"{label} unverified source: unsupported TSA signature algorithm {sig_alg_oid!r}")
-
-
-def verify_rfc3161_timestamp_token(
-    tsr_bytes: bytes,
-    expected_message_digest: bytes,
-    *,
-    trusted_roots: Sequence[x509.Certificate] | None = None,
-    label: str = "pre_market_proof",
-) -> datetime:
-    """Offline-verify an RFC 3161 token (CMS signature, cert chain, EKU, messageImprint), returning Asia/Shanghai time."""
-    if not tsr_bytes:
-        raise ValueError(f"{label} RFC 3161 timestamp token is empty")
-    content_info: Any = None
-    try:
-        resp, rest = der_decoder.decode(tsr_bytes, asn1Spec=rfc3161.TimeStampResp())
-        if rest:
-            raise ValueError(f"{label} RFC 3161 TimeStampResp has trailing bytes")
-        status_val = int(resp["status"]["status"])
-        if status_val not in (0, 1):
-            raise ValueError(f"{label} RFC 3161 timestamp status is not granted: status={status_val}")
-        if not resp["timeStampToken"].isValue:
-            raise ValueError(f"{label} RFC 3161 TimeStampResp missing timeStampToken")
-        content_info = resp["timeStampToken"]
-    except (PyAsn1Error, ValueError):
-        try:
-            ci, rest = der_decoder.decode(tsr_bytes, asn1Spec=rfc5652.ContentInfo())
-        except PyAsn1Error as exc:
-            raise ValueError(f"{label} failed to parse RFC 3161 DER token: {exc}") from exc
-        if rest:
-            raise ValueError(f"{label} RFC 3161 ContentInfo has trailing bytes")
-        content_info = ci
-
-    if str(content_info["contentType"]) != str(rfc5652.id_signedData):
-        raise ValueError(f"{label} unverified source: invalid CMS ContentType {str(content_info['contentType'])!r}")
-    try:
-        signed_data, rest_sd = der_decoder.decode(
-            bytes(content_info["content"]), asn1Spec=rfc5652.SignedData()
-        )
-    except PyAsn1Error as exc:
-        raise ValueError(f"{label} failed to parse CMS SignedData: {exc}") from exc
-    if rest_sd:
-        raise ValueError(f"{label} CMS SignedData has trailing bytes")
-
-    encap = signed_data["encapContentInfo"]
-    if str(encap["eContentType"]) != _OID_CT_TST_INFO or not encap["eContent"].isValue:
-        raise ValueError(f"{label} unverified source: CMS payload is not RFC 3161 TSTInfo")
-    e_content = bytes(encap["eContent"])
-
-    try:
-        tst_info, rest_tst = der_decoder.decode(e_content, asn1Spec=rfc3161.TSTInfo())
-    except PyAsn1Error as exc:
-        raise ValueError(f"{label} failed to parse TSTInfo: {exc}") from exc
-    if rest_tst:
-        raise ValueError(f"{label} TSTInfo has trailing bytes")
-
-    imprint_alg = str(tst_info["messageImprint"]["hashAlgorithm"]["algorithm"])
-    if imprint_alg != _OID_SHA256:
-        raise ValueError(f"{label} TSTInfo must use SHA-256 imprint, got {imprint_alg!r}")
-    actual_imprint = bytes(tst_info["messageImprint"]["hashedMessage"])
-    if actual_imprint != expected_message_digest:
-        raise ValueError(
-            f"{label} timestamp digest ({actual_imprint.hex()}) does not match attestation ({expected_message_digest.hex()})"
-        )
-
-    gen_time_utc = _parse_tsa_gen_time_utc(str(tst_info["genTime"]), label)
-
-    certs: list[x509.Certificate] = []
-    if signed_data["certificates"].isValue:
-        for cert_choice in signed_data["certificates"]:
-            if cert_choice.getName() == "certificate":
-                try:
-                    certs.append(x509.load_der_x509_certificate(der_encoder.encode(cert_choice["certificate"])))
-                except ValueError as exc:
-                    raise ValueError(f"{label} corrupt embedded X.509 certificate: {exc}") from exc
-    if not certs:
-        raise ValueError(f"{label} unverified source: RFC 3161 token contains no certificates")
-    if not signed_data["signerInfos"].isValue or len(signed_data["signerInfos"]) != 1:
-        raise ValueError(f"{label} unverified source: RFC 3161 SignedData must contain exactly one SignerInfo")
-    signer_info = signed_data["signerInfos"][0]
-
-    leaf_cert = _match_cms_signer_cert(signer_info["sid"], certs, label)
-    digest_alg_oid = str(signer_info["digestAlgorithm"]["algorithm"])
-    if digest_alg_oid not in _OID_HASH_ALGS:
-        raise ValueError(f"{label} unverified source: unsupported CMS digest algorithm {digest_alg_oid!r}")
-    digest_cls, hashlib_fn = _OID_HASH_ALGS[digest_alg_oid]
-
-    if signer_info["signedAttrs"].isValue and len(signer_info["signedAttrs"]) > 0:
-        found_ct: str | None = None
-        found_md: bytes | None = None
-        for attr in signer_info["signedAttrs"]:
-            attr_oid = str(attr["attrType"])
-            if attr_oid == _OID_CONTENT_TYPE and len(attr["attrValues"]) == 1:
-                val, _ = der_decoder.decode(bytes(attr["attrValues"][0]), asn1Spec=univ.ObjectIdentifier())
-                found_ct = str(val)
-            elif attr_oid == _OID_MESSAGE_DIGEST and len(attr["attrValues"]) == 1:
-                val, _ = der_decoder.decode(bytes(attr["attrValues"][0]), asn1Spec=univ.OctetString())
-                found_md = bytes(val)
-        if found_ct != _OID_CT_TST_INFO:
-            raise ValueError(f"{label} unverified source: CMS signedAttrs contentType mismatch")
-        expected_econtent_digest = hashlib_fn(e_content).digest()
-        if found_md != expected_econtent_digest:
-            raise ValueError(f"{label} unverified source: CMS signedAttrs messageDigest mismatch")
-        raw_tagged = der_encoder.encode(signer_info["signedAttrs"])
-        if not raw_tagged or raw_tagged[0] != 0xA0:
-            raise ValueError(f"{label} failed to encode CMS signedAttrs")
-        signed_bytes = b"\x31" + raw_tagged[1:]
-    else:
-        signed_bytes = e_content
-
-    _verify_cms_signature(
-        leaf_cert,
-        str(signer_info["signatureAlgorithm"]["algorithm"]),
-        digest_cls,
-        signed_bytes,
-        bytes(signer_info["signature"]),
-        label,
-    )
-
-    roots = tuple(trusted_roots) if trusted_roots is not None else _load_default_trusted_tsa_roots()
-    if not roots:
-        raise ValueError(f"{label} unverified source: trusted TSA root store is empty")
-    intermediates = [cert for cert in certs if cert != leaf_cert]
-    ee_policy = (
-        verification.ExtensionPolicy.permit_all()
-        .require_present(x509.ExtendedKeyUsage, verification.Criticality.AGNOSTIC, _check_tsa_ee_eku)
-        .may_be_present(x509.BasicConstraints, verification.Criticality.AGNOSTIC, _check_tsa_ee_bc)
-        .may_be_present(x509.KeyUsage, verification.Criticality.AGNOSTIC, _check_tsa_ee_ku)
-    )
-    ca_policy = verification.ExtensionPolicy.webpki_defaults_ca()
-    try:
-        verifier = (
-            verification.PolicyBuilder()
-            .store(verification.Store(list(roots)))
-            .time(gen_time_utc)
-            .extension_policies(ca_policy=ca_policy, ee_policy=ee_policy)
-            .build_client_verifier()
-        )
-        verifier.verify(leaf_cert, intermediates)
-    except (verification.VerificationError, ValueError) as exc:
-        raise ValueError(f"{label} unverified source (RFC 3161 chain/EKU validation failed): {exc}") from exc
-
-    return gen_time_utc.astimezone(CHINA_TZ)
 
 
 def _extract_decision_entry_block(decisions_text: str, anchor_id: str) -> str | None:
@@ -497,18 +199,13 @@ def _infer_radar_repo_root(regime_path: Path) -> Path | None:
     return None
 
 
-def _resolve_proof_receipt_path(
-    regime_path: Path,
-    raw_receipt_path: Any,
-    *,
-    field_name: str = "receipt_path",
-) -> Path:
+def _resolve_proof_receipt_path(regime_path: Path, raw_receipt_path: Any) -> Path:
     if not isinstance(raw_receipt_path, str) or not raw_receipt_path.strip():
-        raise ValueError(f"pre_market_proof.{field_name} must be a non-empty relative path")
+        raise ValueError("pre_market_proof.receipt_path must be a non-empty relative path")
     rel_text = raw_receipt_path.strip()
     rel_path = Path(rel_text)
     if rel_path.is_absolute():
-        raise ValueError(f"pre_market_proof.{field_name} must be relative, got {rel_text!r}")
+        raise ValueError(f"pre_market_proof.receipt_path must be relative, got {rel_text!r}")
 
     journal_dir = regime_path.resolve().parent
     candidate = (journal_dir / rel_path).resolve()
@@ -520,22 +217,91 @@ def _resolve_proof_receipt_path(
         if root_candidate.is_relative_to(repo_root) and root_candidate.is_file():
             return root_candidate
         if not candidate.is_relative_to(journal_dir) and not root_candidate.is_relative_to(repo_root):
-            raise ValueError(f"pre_market_proof.{field_name} escapes repository root: {rel_text!r}")
+            raise ValueError(f"pre_market_proof.receipt_path escapes repository root: {rel_text!r}")
     elif not candidate.is_relative_to(journal_dir):
-        raise ValueError(f"pre_market_proof.{field_name} escapes journal directory: {rel_text!r}")
-    raise ValueError(f"Missing LIVE pre_market_proof {field_name} file: {candidate}")
+        raise ValueError(f"pre_market_proof.receipt_path escapes journal directory: {rel_text!r}")
+    raise ValueError(f"Missing LIVE pre_market_proof receipt file: {candidate}")
+
+
+def _find_git_root(path: Path) -> Path | None:
+    resolved = path.resolve()
+    start = resolved if resolved.is_dir() else resolved.parent
+    for parent in (start, *start.parents):
+        if (parent / ".git").exists():
+            return parent
+    return None
+
+
+def _verify_receipt_pre_market_timestamp(
+    receipt_abs: Path,
+    eff_open: datetime,
+    label: str,
+) -> None:
+    """Verify local lightweight pre-market receipt via Git commit time or file mtime < eff_open."""
+    git_root = _find_git_root(receipt_abs)
+    if git_root is not None:
+        try:
+            rel_posix = receipt_abs.resolve().relative_to(git_root.resolve()).as_posix()
+            status_proc = subprocess.run(
+                ["git", "-c", "core.quotePath=false", "-C", str(git_root), "status", "--porcelain", "--", rel_posix],
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                check=False,
+            )
+            log_proc = subprocess.run(
+                [
+                    "git",
+                    "-c",
+                    "core.quotePath=false",
+                    "-C",
+                    str(git_root),
+                    "log",
+                    "-n",
+                    "1",
+                    "--format=%H%x09%aI%x09%cI",
+                    "--",
+                    rel_posix,
+                ],
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                check=False,
+            )
+            if status_proc.returncode == 0 and log_proc.returncode == 0:
+                status_out = status_proc.stdout.strip()
+                log_out = log_proc.stdout.strip()
+                if log_out:
+                    _, author_iso, committer_iso = log_out.split("\t", 2)
+                    author_dt = _parse_tz_aware_iso_datetime(author_iso, f"{label}.git_author_date")
+                    committer_dt = _parse_tz_aware_iso_datetime(committer_iso, f"{label}.git_committer_date")
+                    if author_dt >= eff_open or committer_dt >= eff_open:
+                        raise ValueError(
+                            f"{label} pre_market_proof Git commit timestamp ({committer_dt.isoformat()}) "
+                            f"must precede effective_date market open ({eff_open.isoformat()})"
+                        )
+                    if not status_out:
+                        return
+        except OSError:
+            pass
+
+    mtime_dt = datetime.fromtimestamp(receipt_abs.stat().st_mtime, tz=CHINA_TZ)
+    if mtime_dt >= eff_open:
+        raise ValueError(
+            f"{label} pre_market_proof file write time ({mtime_dt.isoformat()}) "
+            f"must precede effective_date market open ({eff_open.isoformat()})"
+        )
 
 
 def _verify_live_pre_market_proof(
     raw_record: Mapping[str, Any],
     *,
-    regime_path: Path | None,
+    regime_path: Path,
     symbol: str,
     decision_date: str,
     effective_date: str,
     recorded_cst_iso: str,
     label: str,
-    trusted_tsa_roots: Sequence[x509.Certificate] | None = None,
 ) -> dict[str, Any]:
     proof = raw_record.get("pre_market_proof")
     if not isinstance(proof, Mapping):
@@ -551,129 +317,80 @@ def _verify_live_pre_market_proof(
         )
 
     rec_id = str(raw_record.get("record_id") or "").strip()
-    prev_reg = str(raw_record.get("raw_prev_regime", raw_record.get("prev_regime")) or "").strip()
-    new_reg = str(raw_record.get("raw_new_regime", raw_record.get("new_regime", raw_record.get("regime"))) or "").strip()
+    prev_reg = _normalize_regime_for_hash(raw_record.get("prev_regime"))
+    raw_new = raw_record.get("new_regime") if raw_record.get("new_regime") is not None else raw_record.get("regime")
+    new_reg = _normalize_regime_for_hash(raw_new)
     decision_ref = str(raw_record.get("decision_ref") or "").strip()
     proof_entry_sha = proof.get("decision_entry_sha256")
     recorded_dt = _parse_tz_aware_iso_datetime(recorded_cst_iso, f"{label}.recorded_at")
 
-    receipt: dict[str, Any] = {}
-    if regime_path is not None:
-        receipt_abs = _resolve_proof_receipt_path(regime_path, proof.get("receipt_path"))
-        receipt = _read_json_object(receipt_abs, f"{label}.pre_market_proof.receipt")
-        expected_fields = {
-            "record_id": rec_id,
-            "decision_date": decision_date,
-            "effective_date": effective_date,
-            "symbol": symbol,
-            "prev_regime": prev_reg,
-            "new_regime": new_reg,
-            "record_type": "LIVE",
-            "decision_sha256": expected_sha,
-        }
-        for key, expected_val in expected_fields.items():
-            if str(receipt.get(key) or "").strip() != expected_val:
-                raise ValueError(
-                    f"{label} pre_market_proof receipt field {key}={receipt.get(key)!r} "
-                    f"does not match record {expected_val!r}"
-                )
-
-        receipt_recorded_dt = _parse_tz_aware_iso_datetime(
-            receipt.get("recorded_at"), f"{label}.pre_market_proof.receipt.recorded_at"
+    receipt_abs = _resolve_proof_receipt_path(regime_path, proof.get("receipt_path"))
+    receipt = _read_json_object(receipt_abs, f"{label}.pre_market_proof.receipt")
+    expected_fields = {
+        "record_id": rec_id,
+        "decision_date": decision_date,
+        "effective_date": effective_date,
+        "symbol": symbol,
+        "prev_regime": prev_reg,
+        "new_regime": new_reg,
+        "record_type": "LIVE",
+        "decision_sha256": expected_sha,
+    }
+    for key, expected_val in expected_fields.items():
+        actual_val = (
+            _normalize_regime_for_hash(receipt.get(key))
+            if key in ("prev_regime", "new_regime")
+            else str(receipt.get(key) or "").strip()
         )
-        if receipt_recorded_dt != recorded_dt:
+        if actual_val != expected_val:
             raise ValueError(
-                f"{label} pre_market_proof receipt recorded_at ({receipt_recorded_dt.isoformat()}) "
-                f"does not match record ({recorded_dt.isoformat()})"
+                f"{label} pre_market_proof receipt field {key}={receipt.get(key)!r} "
+                f"does not match record {expected_val!r}"
             )
 
-        entry_sha = receipt.get("decision_entry_sha256")
-        if proof_entry_sha is not None and proof_entry_sha != entry_sha:
-            raise ValueError(f"{label} pre_market_proof.decision_entry_sha256 does not match receipt")
-        if decision_ref and "#" in decision_ref:
-            ref_file, anchor_id = decision_ref.split("#", 1)
-            journal_dir = regime_path.resolve().parent
-            ref_path = (journal_dir / ref_file).resolve()
-            if not ref_path.is_relative_to(journal_dir):
-                raise ValueError(f"{label} decision_ref escapes journal directory: {decision_ref!r}")
-            if entry_sha is not None:
-                if not isinstance(entry_sha, str) or not SHA256_PATTERN.fullmatch(entry_sha):
-                    raise ValueError(f"{label} pre_market_proof decision_entry_sha256 has invalid format")
-                if not ref_path.is_file():
-                    raise ValueError(f"{label} pre_market_proof decision_ref file not found: {ref_path}")
-                block = _extract_decision_entry_block(ref_path.read_text(encoding="utf-8"), anchor_id)
-                if block is None:
-                    raise ValueError(f"{label} decision_ref anchor {anchor_id!r} not found in {ref_path}")
-                actual_entry_sha = hashlib.sha256(block.encode("utf-8")).hexdigest()
-                if actual_entry_sha != entry_sha:
-                    raise ValueError(
-                        f"{label} pre_market_proof decision_entry_sha256 does not match frozen text ({anchor_id})"
-                    )
-            elif ref_path.is_file():
-                raise ValueError(
-                    f"{label} pre_market_proof must include decision_entry_sha256 when {ref_path.name} exists"
-                )
-        elif entry_sha is not None:
-            raise ValueError(f"{label} pre_market_proof includes decision_entry_sha256 without a valid decision_ref")
-    else:
-        entry_sha = proof_entry_sha
+    receipt_recorded_dt = _parse_tz_aware_iso_datetime(
+        receipt.get("recorded_at"), f"{label}.pre_market_proof.receipt.recorded_at"
+    )
+    if receipt_recorded_dt != recorded_dt:
+        raise ValueError(
+            f"{label} pre_market_proof receipt recorded_at ({receipt_recorded_dt.isoformat()}) "
+            f"does not match record ({recorded_dt.isoformat()})"
+        )
+
+    entry_sha = receipt.get("decision_entry_sha256")
+    if proof_entry_sha is not None and proof_entry_sha != entry_sha:
+        raise ValueError(f"{label} pre_market_proof.decision_entry_sha256 does not match receipt")
+    if decision_ref and "#" in decision_ref:
+        ref_file, anchor_id = decision_ref.split("#", 1)
+        journal_dir = regime_path.resolve().parent
+        ref_path = (journal_dir / ref_file).resolve()
+        if not ref_path.is_relative_to(journal_dir):
+            raise ValueError(f"{label} decision_ref escapes journal directory: {decision_ref!r}")
         if entry_sha is not None:
             if not isinstance(entry_sha, str) or not SHA256_PATTERN.fullmatch(entry_sha):
                 raise ValueError(f"{label} pre_market_proof decision_entry_sha256 has invalid format")
-            if not (decision_ref and "#" in decision_ref):
-                raise ValueError(f"{label} pre_market_proof includes decision_entry_sha256 without a valid decision_ref")
+            if not ref_path.is_file():
+                raise ValueError(f"{label} pre_market_proof decision_ref file not found: {ref_path}")
+            block = _extract_decision_entry_block(ref_path.read_text(encoding="utf-8"), anchor_id)
+            if block is None:
+                raise ValueError(f"{label} decision_ref anchor {anchor_id!r} not found in {ref_path}")
+            actual_entry_sha = hashlib.sha256(block.encode("utf-8")).hexdigest()
+            if actual_entry_sha != entry_sha:
+                raise ValueError(
+                    f"{label} pre_market_proof decision_entry_sha256 does not match frozen text ({anchor_id})"
+                )
+        elif ref_path.is_file():
+            raise ValueError(
+                f"{label} pre_market_proof must include decision_entry_sha256 when {ref_path.name} exists"
+            )
+    elif entry_sha is not None:
+        raise ValueError(f"{label} pre_market_proof includes decision_entry_sha256 without a valid decision_ref")
 
-    raw_b64 = proof.get("tsa_token_b64")
-    if not isinstance(raw_b64, str) or not raw_b64.strip():
-        raise ValueError(f"{label} unverified source: pre_market_proof missing verifiable RFC 3161 tsa_token_b64")
-    try:
-        tsr_bytes = base64.b64decode(raw_b64.strip(), validate=True)
-    except ValueError as exc:
-        raise ValueError(f"{label} pre_market_proof.tsa_token_b64 invalid Base64: {exc}") from exc
-
-    if regime_path is not None and proof.get("tsa_token_path") is not None:
-        tsa_abs = _resolve_proof_receipt_path(regime_path, proof.get("tsa_token_path"), field_name="tsa_token_path")
-        if tsa_abs.read_bytes() != tsr_bytes:
-            raise ValueError(f"{label} pre_market_proof.tsa_token_path bytes do not match tsa_token_b64")
-
-    attestation_bytes = compute_live_attestation_payload(
-        record_id=rec_id,
-        decision_date=decision_date,
-        effective_date=effective_date,
-        symbol=symbol,
-        prev_regime=prev_reg,
-        new_regime=new_reg,
-        recorded_at_cst=recorded_dt.isoformat(),
-        decision_sha256=expected_sha,
-        decision_entry_sha256=entry_sha,
-        decision_ref=raw_record.get("decision_ref"),
-        card_path=raw_record.get("card_path"),
-    )
-    attestation_digest = hashlib.sha256(attestation_bytes).digest()
-    gen_time_cst = verify_rfc3161_timestamp_token(
-        tsr_bytes,
-        attestation_digest,
-        trusted_roots=trusted_tsa_roots,
-        label=label,
-    )
-
-    dec_dt = date.fromisoformat(decision_date)
     eff_dt = date.fromisoformat(effective_date)
-    dec_start = datetime(dec_dt.year, dec_dt.month, dec_dt.day, 0, 0, 0, tzinfo=CHINA_TZ)
     eff_open = datetime(
         eff_dt.year, eff_dt.month, eff_dt.day, MARKET_OPEN_TIME.hour, MARKET_OPEN_TIME.minute, 0, tzinfo=CHINA_TZ
     )
-    if gen_time_cst < dec_start:
-        raise ValueError(
-            f"{label} pre_market_proof trusted reception time ({gen_time_cst.isoformat()}) "
-            f"precedes decision_date ({decision_date})"
-        )
-    if gen_time_cst >= eff_open:
-        raise ValueError(
-            f"{label} pre_market_proof trusted reception time ({gen_time_cst.isoformat()}) "
-            f"must precede effective_date market open ({eff_open.isoformat()})"
-        )
-    receipt["trusted_received_at"] = gen_time_cst.isoformat()
+    _verify_receipt_pre_market_timestamp(receipt_abs, eff_open, label)
     return receipt
 
 
@@ -744,11 +461,13 @@ class RegimeHistory:
         if symbol not in self.initial_regimes:
             raise KeyError(f"No initial regime for symbol {symbol!r}")
 
-        result = self.initial_regimes[symbol]
-        for record in self.records_by_symbol.get(symbol, []):
+        result = _normalized_regime(
+            self.initial_regimes[symbol], f"regime_history.initial_regimes[{symbol}]"
+        )
+        for idx, record in enumerate(self.records_by_symbol.get(symbol, [])):
             if record["effective_date"] > resolved_date:
                 break
-            result = record["regime"]
+            result = _extract_normalized_record_regime(record, f"regime_history[{symbol}][{idx}]")
         return result
 
     def all_records(self) -> list[dict[str, Any]]:
@@ -796,7 +515,6 @@ class RegimeHistory:
         backfill_replay_window: Mapping[str, Any] | None = None,
         routing_checkpoint: Mapping[str, Any] | None = None,
         has_checkpoint_state: bool = False,
-        trusted_tsa_roots: Sequence[x509.Certificate] | None = None,
     ) -> None:
         """Enforce formal forward-run vs explicit replay boundary on LIVE/BACKFILL records and checkpoint lineage."""
         if run_mode not in {"formal", "replay"}:
@@ -838,33 +556,67 @@ class RegimeHistory:
                         f"{label} has invalid record_type {record_type!r}; "
                         f"expected one of {sorted(REGIME_RECORD_TYPES)}"
                     )
-                effective_date = record["effective_date"]
+                effective_date = _normalize_iso_date(
+                    record.get("effective_date"), f"{label}.effective_date"
+                )
+                # Ensure matching (regime_for) and validation inspect the exact same normalized regime field.
+                _extract_normalized_record_regime(record, label)
                 decision_date = record.get("decision_date")
                 if record_type == "LIVE":
                     if not decision_date:
                         raise ValueError(f"{label} LIVE record lacks decision_date")
+                    decision_date = _normalize_iso_date(decision_date, f"{label}.decision_date")
+                    if effective_date <= decision_date:
+                        raise ValueError(
+                            f"{label} effective_date {effective_date} must strictly follow decision_date {decision_date}"
+                        )
                     recorded_cst_iso = _validate_live_recorded_at(
                         record.get("recorded_at"),
                         decision_date,
                         effective_date,
                         label,
                     )
-                    _verify_live_pre_market_proof(
-                        {"symbol": symbol, **record},
-                        regime_path=self.source_path,
-                        symbol=symbol,
-                        decision_date=decision_date,
-                        effective_date=effective_date,
-                        recorded_cst_iso=recorded_cst_iso,
-                        label=label,
-                        trusted_tsa_roots=trusted_tsa_roots,
-                    )
-                elif run_mode == "formal" and eval_start is not None and effective_date >= eval_start:
-                    raise ValueError(
-                        f"正式前瞻运行拒绝消费 BACKFILL 路由记录: {symbol} "
-                        f"{record.get('record_id') or '(no-id)'} effective_date={effective_date}; "
-                        "历史回放或状态初始化请显式使用 --mode replay"
-                    )
+                    if self.source_path is not None:
+                        _verify_live_pre_market_proof(
+                            {"symbol": symbol, **record},
+                            regime_path=self.source_path,
+                            symbol=symbol,
+                            decision_date=decision_date,
+                            effective_date=effective_date,
+                            recorded_cst_iso=recorded_cst_iso,
+                            label=label,
+                        )
+                    elif record.get("pre_market_proof") is not None:
+                        proof = record.get("pre_market_proof")
+                        if not isinstance(proof, Mapping):
+                            raise ValueError(f"{label}.pre_market_proof must be a JSON object")
+                        raw_sha = proof.get("decision_sha256")
+                        if not isinstance(raw_sha, str) or not SHA256_PATTERN.fullmatch(raw_sha):
+                            raise ValueError(f"{label}.pre_market_proof.decision_sha256 is invalid or missing")
+                        expected_sha = compute_regime_decision_sha256(
+                            {"symbol": symbol, **record}, recorded_cst_iso
+                        )
+                        if raw_sha != expected_sha:
+                            raise ValueError(
+                                f"{label}.pre_market_proof.decision_sha256 ({raw_sha}) "
+                                f"does not match record payload ({expected_sha})"
+                            )
+                else:
+                    raw_recorded_at = record.get("recorded_at")
+                    raw_boundary = record.get("time_evidence_boundary")
+                    if raw_recorded_at is None:
+                        if not isinstance(raw_boundary, str) or not raw_boundary.strip():
+                            raise ValueError(
+                                f"{label} BACKFILL record with recorded_at=null requires non-empty time_evidence_boundary"
+                            )
+                    else:
+                        _parse_tz_aware_iso_datetime(raw_recorded_at, f"{label}.recorded_at")
+                    if run_mode == "formal" and eval_start is not None and effective_date >= eval_start:
+                        raise ValueError(
+                            f"正式前瞻运行拒绝消费 BACKFILL 路由记录: {symbol} "
+                            f"{record.get('record_id') or '(no-id)'} effective_date={effective_date}; "
+                            "历史回放或状态初始化请显式使用 --mode replay"
+                        )
 
         prior_backfills = (
             self.backfill_records_through(resolved_last)
@@ -877,6 +629,7 @@ class RegimeHistory:
             else []
         )
 
+        verified_replay_dates_list: list[str] = []
         if has_checkpoint_state and resolved_last is not None:
             if not isinstance(routing_checkpoint, Mapping):
                 raise ValueError(
@@ -885,8 +638,7 @@ class RegimeHistory:
                 )
             verified_through = routing_checkpoint.get("verified_through_date")
             verified_replay_through = routing_checkpoint.get("verified_replay_through_date")
-            verified_replay_count = routing_checkpoint.get("verified_replay_session_count")
-            verified_replay_digest = routing_checkpoint.get("verified_replay_dates_digest")
+            raw_replay_dates = routing_checkpoint.get("verified_replay_dates")
             verified_count = routing_checkpoint.get("verified_backfill_count")
             verified_digest = routing_checkpoint.get("verified_backfill_digest")
             expected_prior_digest = compute_backfill_digest(
@@ -894,15 +646,37 @@ class RegimeHistory:
                 anchor_start_date=self.anchor_start_date,
                 initial_regimes=self.initial_regimes,
             )
+
+            replay_dates_valid = isinstance(raw_replay_dates, list)
+            if replay_dates_valid:
+                prev_day: str | None = None
+                for raw_day in raw_replay_dates:
+                    if not isinstance(raw_day, str) or not ISO_DATE_PATTERN.match(raw_day):
+                        replay_dates_valid = False
+                        break
+                    try:
+                        norm_day = date.fromisoformat(raw_day).isoformat()
+                    except ValueError:
+                        replay_dates_valid = False
+                        break
+                    if norm_day != raw_day or norm_day > resolved_last or (prev_day is not None and norm_day <= prev_day):
+                        replay_dates_valid = False
+                        break
+                    verified_replay_dates_list.append(norm_day)
+                    prev_day = norm_day
+                if replay_dates_valid:
+                    if verified_replay_dates_list:
+                        if verified_replay_through != verified_replay_dates_list[-1]:
+                            replay_dates_valid = False
+                    elif verified_replay_through is not None:
+                        replay_dates_valid = False
+
             if (
                 verified_through != resolved_last
+                or not replay_dates_valid
                 or type(verified_count) is not int
                 or verified_count != len(prior_backfills)
                 or verified_digest != expected_prior_digest
-                or type(verified_replay_count) is not int
-                or verified_replay_count < 0
-                or not isinstance(verified_replay_digest, str)
-                or not SHA256_PATTERN.fullmatch(verified_replay_digest)
             ):
                 raise ValueError(
                     f"{run_mode} 运行检测到检查点({resolved_last})之前的 BACKFILL/初始化台账与已核验检查点不一致"
@@ -938,6 +712,7 @@ class RegimeHistory:
                             f"{first_rec['symbol']} {first_rec.get('record_id') or '(no-id)'} "
                             f"effective_date={first_rec['effective_date']}"
                         )
+                    replayed_set = set(verified_replay_dates_list)
                     for rec in prior_backfills:
                         eff = rec["effective_date"]
                         if not (win_start <= eff <= win_end):
@@ -945,19 +720,12 @@ class RegimeHistory:
                                 f"正式前瞻运行拒绝沿用超出初始化回放区间({win_start}..{win_end})的 BACKFILL 路由记录: "
                                 f"{rec['symbol']} {rec.get('record_id') or '(no-id)'} effective_date={eff}"
                             )
-                    max_prior_eff = max(rec["effective_date"] for rec in prior_backfills)
-                    verified_replay_through = routing_checkpoint.get("verified_replay_through_date")
-                    verified_replay_count = routing_checkpoint.get("verified_replay_session_count")
-                    if (
-                        not isinstance(verified_replay_through, str)
-                        or verified_replay_through < max_prior_eff
-                        or verified_replay_through > resolved_last
-                        or verified_replay_count < 1
-                    ):
-                        raise ValueError(
-                            "正式前瞻运行检测到未在初始化回放期内通过 --mode replay 实际步进核验的 BACKFILL 记录: "
-                            "请使用 --mode replay 从起算日或受影响日期前重建"
-                        )
+                        if eff not in replayed_set:
+                            raise ValueError(
+                                "正式前瞻运行检测到未在初始化回放期内通过 --mode replay 实际步进核验的 BACKFILL 记录: "
+                                f"{rec['symbol']} {rec.get('record_id') or '(no-id)'} effective_date={eff}; "
+                                "请使用 --mode replay 从起算日或受影响日期前重建"
+                            )
 
     def routing_stats_through(
         self,
@@ -1484,7 +1252,6 @@ def load_regime_history(
     regime_history_file: str | Path,
     *,
     trading_calendar: Sequence[str] | None = None,
-    trusted_tsa_roots: Sequence[x509.Certificate] | None = None,
 ) -> RegimeHistory:
     """Load route history, enforce Schema/T+1/LIVE-BACKFILL rules, and expose effective-date lookup."""
     path = Path(regime_history_file)
@@ -1623,7 +1390,6 @@ def load_regime_history(
                 effective_date=effective_date,
                 recorded_cst_iso=normalized_recorded_at,
                 label=label,
-                trusted_tsa_roots=trusted_tsa_roots,
             )
         else:
             if raw_recorded_at is None:

@@ -5,7 +5,6 @@ from __future__ import annotations
 from bisect import bisect_left
 from dataclasses import asdict, dataclass, field, replace
 from datetime import date, timedelta
-import hashlib
 import math
 from typing import Any, Mapping, Sequence
 
@@ -38,7 +37,6 @@ FIXED_REGIMES = {"B1": "TREND_UP", "B2": "RANGE_GRID", "C": "BUY_AND_HOLD", "D":
 CASH_REGIMES = {"TRANSITION", "TRAP_OFF"}
 SECTOR_COUNT = 6
 VALID_RUN_MODES = ("formal", "replay")
-REPLAY_DATES_SEED_DIGEST = hashlib.sha256(b"REPLAY_DATES:v1").hexdigest()
 
 
 @dataclass
@@ -214,8 +212,7 @@ class SimulationEngine:
         self._routing_checkpoint_missing = False
         self._verified_through_date: str | None = None
         self._verified_replay_through_date: str | None = None
-        self._verified_replay_session_count = 0
-        self._verified_replay_dates_digest = REPLAY_DATES_SEED_DIGEST
+        self._verified_replay_dates: list[str] = []
         self._verified_backfill_count = 0
         self._verified_backfill_digest = compute_backfill_digest(
             [],
@@ -233,8 +230,7 @@ class SimulationEngine:
         return {
             "verified_through_date": self._verified_through_date,
             "verified_replay_through_date": self._verified_replay_through_date,
-            "verified_replay_session_count": self._verified_replay_session_count,
-            "verified_replay_dates_digest": self._verified_replay_dates_digest,
+            "verified_replay_dates": list(self._verified_replay_dates),
             "verified_backfill_count": self._verified_backfill_count,
             "verified_backfill_digest": self._verified_backfill_digest,
         }
@@ -242,14 +238,13 @@ class SimulationEngine:
     def _refresh_replay_checkpoint(self) -> None:
         if self.last_processed_date is None:
             return
+        self._has_checkpoint_state = True
         self._routing_checkpoint_missing = False
         self._verified_through_date = self.last_processed_date
         if self.run_mode == "replay":
             self._verified_replay_through_date = self.last_processed_date
-            self._verified_replay_session_count += 1
-            self._verified_replay_dates_digest = hashlib.sha256(
-                f"{self._verified_replay_dates_digest}|{self.last_processed_date}".encode("utf-8")
-            ).hexdigest()
+            if not self._verified_replay_dates or self._verified_replay_dates[-1] != self.last_processed_date:
+                self._verified_replay_dates.append(self.last_processed_date)
             bf_records = self.bundle.regime_history.backfill_records_through(self.last_processed_date)
             self._verified_backfill_count = len(bf_records)
             self._verified_backfill_digest = compute_backfill_digest(
@@ -321,8 +316,7 @@ class SimulationEngine:
             self._routing_checkpoint_missing = last_date is not None
             self._verified_through_date = None
             self._verified_replay_through_date = None
-            self._verified_replay_session_count = 0
-            self._verified_replay_dates_digest = REPLAY_DATES_SEED_DIGEST
+            self._verified_replay_dates = []
             self._verified_backfill_count = 0
             self._verified_backfill_digest = ""
         else:
@@ -330,8 +324,7 @@ class SimulationEngine:
                 raise ValueError("Invalid checkpoint routing_checkpoint: expected JSON object")
             verified_through = routing_cp.get("verified_through_date")
             verified_replay_through = routing_cp.get("verified_replay_through_date")
-            verified_replay_count = routing_cp.get("verified_replay_session_count")
-            verified_replay_digest = routing_cp.get("verified_replay_dates_digest")
+            raw_replay_dates = routing_cp.get("verified_replay_dates")
             verified_count = routing_cp.get("verified_backfill_count")
             verified_digest = routing_cp.get("verified_backfill_digest")
             if verified_through is not None:
@@ -346,10 +339,25 @@ class SimulationEngine:
                 verified_replay_through = date.fromisoformat(verified_replay_through).isoformat()
                 if last_date is not None and verified_replay_through > last_date:
                     raise ValueError("Checkpoint verified_replay_through_date exceeds last_processed_date")
-            if type(verified_replay_count) is not int or verified_replay_count < 0:
-                raise ValueError("Invalid checkpoint verified_replay_session_count")
-            if not isinstance(verified_replay_digest, str) or not SHA256_PATTERN.fullmatch(verified_replay_digest):
-                raise ValueError("Invalid checkpoint verified_replay_dates_digest")
+            if not isinstance(raw_replay_dates, list):
+                raise ValueError("Invalid checkpoint verified_replay_dates: expected list")
+            verified_replay_dates: list[str] = []
+            for raw_day in raw_replay_dates:
+                if not isinstance(raw_day, str):
+                    raise ValueError("Invalid checkpoint verified_replay_dates entry")
+                norm_day = date.fromisoformat(raw_day).isoformat()
+                if norm_day != raw_day:
+                    raise ValueError(f"Non-canonical checkpoint replay date: {raw_day!r}")
+                if last_date is not None and norm_day > last_date:
+                    raise ValueError("Checkpoint verified_replay_dates exceeds last_processed_date")
+                if verified_replay_dates and norm_day <= verified_replay_dates[-1]:
+                    raise ValueError("Checkpoint verified_replay_dates must be strictly ascending")
+                verified_replay_dates.append(norm_day)
+            if verified_replay_dates:
+                if verified_replay_through != verified_replay_dates[-1]:
+                    raise ValueError("Checkpoint verified_replay_through_date does not match verified_replay_dates")
+            elif verified_replay_through is not None:
+                raise ValueError("Checkpoint verified_replay_through_date set with empty verified_replay_dates")
             if type(verified_count) is not int or verified_count < 0:
                 raise ValueError("Invalid checkpoint verified_backfill_count")
             if not isinstance(verified_digest, str) or not SHA256_PATTERN.fullmatch(verified_digest):
@@ -357,8 +365,7 @@ class SimulationEngine:
             self._routing_checkpoint_missing = False
             self._verified_through_date = verified_through
             self._verified_replay_through_date = verified_replay_through
-            self._verified_replay_session_count = verified_replay_count
-            self._verified_replay_dates_digest = verified_replay_digest
+            self._verified_replay_dates = verified_replay_dates
             self._verified_backfill_count = verified_count
             self._verified_backfill_digest = verified_digest
 
