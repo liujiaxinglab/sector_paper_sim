@@ -7,11 +7,11 @@
   },
   "forward_eval_start_date": null,
   "upstream_paths": {
-    "tdx_daily_dir": "D:/VibeCoding/Quant/QuantData/raw/tdx/vipdoc_parsed",
-    "trade_calendar_dir": "D:/VibeCoding/Quant/QuantData/raw/baostock/query_trade_dates",
-    "corporate_actions_ledger_file": "D:/VibeCoding/Quant/QuantData/reference/etf/corporate_actions/latest/corporate_actions_ledger.json",
-    "regime_history_file": "D:/VibeCoding/Quant/sector_radar/project_content/journal/regime_history.json",
-    "watchlist_file": "D:/VibeCoding/Quant/sector_radar/project_content/config/watchlist.json"
+    "tdx_daily_dir": "../QuantData/raw/tdx/vipdoc_parsed",
+    "trade_calendar_dir": "../QuantData/raw/baostock/query_trade_dates",
+    "corporate_actions_ledger_file": "../QuantData/reference/etf/corporate_actions/latest/corporate_actions_ledger.json",
+    "regime_history_file": "../sector_radar/project_content/journal/regime_history.json",
+    "watchlist_file": "../sector_radar/project_content/config/watchlist.json"
   },
   "account_defaults": {
     "initial_capital": 100000.0,

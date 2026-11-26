@@ -8,6 +8,7 @@ import json
 import os
 from pathlib import Path
 import subprocess
+import sys
 
 import pandas as pd
 import pytest
@@ -863,7 +864,7 @@ def test_pytest_config_imports_package_from_an_external_working_directory(
     )
     result = subprocess.run(
         [
-            "C:/Users/jxing/.conda/envs/quant/python.exe",
+            sys.executable,
             "-m",
             "pytest",
             "-c",
@@ -881,3 +882,53 @@ def test_pytest_config_imports_package_from_an_external_working_directory(
     )
     assert result.returncode == 0, f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}"
     assert "1 passed" in result.stdout
+
+
+def test_committed_sim_config_is_portable_and_resolves_from_any_cwd(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo_root = DEFAULT_SIM_CONFIG_PATH.parents[2]
+    raw_cfg = json.loads(DEFAULT_SIM_CONFIG_PATH.read_text(encoding="utf-8"))
+    raw_upstream = raw_cfg["upstream_paths"]
+    assert raw_upstream["tdx_daily_dir"] == "../QuantData/raw/tdx/vipdoc_parsed"
+    assert raw_upstream["trade_calendar_dir"] == "../QuantData/raw/baostock/query_trade_dates"
+    assert raw_upstream["corporate_actions_ledger_file"] == "../QuantData/reference/etf/corporate_actions/latest/corporate_actions_ledger.json"
+    assert raw_upstream["regime_history_file"] == "../sector_radar/project_content/journal/regime_history.json"
+    assert raw_upstream["watchlist_file"] == "../sector_radar/project_content/config/watchlist.json"
+
+    import re
+
+    forbidden = (
+        "Vibe" + "Coding",
+        "new_" + "tdx64",
+        ".con" + "da",
+    )
+    users_home_re = re.compile(r"[A-Za-z]:[/\\]Users[/\\][^/\\'\"]+")
+    scan_targets = [
+        DEFAULT_SIM_CONFIG_PATH,
+        repo_root / "pyproject.toml",
+        repo_root / "project_content" / "docs" / "01_撮合与切换确定性规则.md",
+        repo_root / "project_content" / "docs" / "02_跨仓路径与CLI运行说明.md",
+        *(repo_root / "project_content" / "src").glob("*.py"),
+        *(repo_root / "project_content" / "tests").glob("*.py"),
+    ]
+    for target in scan_targets:
+        text = target.read_text(encoding="utf-8")
+        for token in forbidden:
+            assert token not in text, f"{target} must not contain machine path {token!r}"
+        assert users_home_re.search(text) is None, f"{target} must not contain user home path"
+
+    monkeypatch.chdir(tmp_path)
+    resolved = load_sim_config(DEFAULT_SIM_CONFIG_PATH)
+    workspace_parent = repo_root.parent
+    assert Path(resolved["upstream_paths"]["tdx_daily_dir"]) == (workspace_parent / "QuantData" / "raw" / "tdx" / "vipdoc_parsed").resolve()
+    assert Path(resolved["upstream_paths"]["trade_calendar_dir"]) == (workspace_parent / "QuantData" / "raw" / "baostock" / "query_trade_dates").resolve()
+    assert Path(resolved["upstream_paths"]["corporate_actions_ledger_file"]) == (
+        workspace_parent / "QuantData" / "reference" / "etf" / "corporate_actions" / "latest" / "corporate_actions_ledger.json"
+    ).resolve()
+    assert Path(resolved["upstream_paths"]["regime_history_file"]) == (
+        workspace_parent / "sector_radar" / "project_content" / "journal" / "regime_history.json"
+    ).resolve()
+    assert Path(resolved["upstream_paths"]["watchlist_file"]) == (
+        workspace_parent / "sector_radar" / "project_content" / "config" / "watchlist.json"
+    ).resolve()

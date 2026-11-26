@@ -858,7 +858,29 @@ def _parse_positive_float(raw_value: Any, label: str) -> float:
     return value
 
 
-def _validate_sim_config(config: Mapping[str, Any], source_label: str) -> dict[str, Any]:
+def _infer_repo_root(config_path: Path) -> Path:
+    resolved = config_path.resolve()
+    if (
+        len(resolved.parents) >= 3
+        and resolved.parent.name == "config"
+        and resolved.parents[1].name == "project_content"
+    ):
+        return resolved.parents[2]
+    return resolved.parent
+
+
+def resolve_config_path(base_root: Path, raw_path: str | Path) -> Path:
+    """Resolve an absolute or repo/config-relative path without depending on cwd."""
+    path = Path(raw_path).expanduser()
+    return path if path.is_absolute() else (base_root / path).resolve()
+
+
+def _validate_sim_config(
+    config: Mapping[str, Any],
+    source_label: str,
+    *,
+    base_root: Path | None = None,
+) -> dict[str, Any]:
     required_top_keys = (
         "project_name",
         "upstream_paths",
@@ -873,6 +895,8 @@ def _validate_sim_config(config: Mapping[str, Any], source_label: str) -> dict[s
     upstream = config["upstream_paths"]
     if not isinstance(upstream, Mapping):
         raise ValueError(f"'upstream_paths' must be a JSON object in {source_label}")
+    resolved_base = base_root or REPO_ROOT
+    resolved_upstream = dict(upstream)
     for key in (
         "tdx_daily_dir",
         "trade_calendar_dir",
@@ -885,6 +909,7 @@ def _validate_sim_config(config: Mapping[str, Any], source_label: str) -> dict[s
             raise ValueError(
                 f"'upstream_paths.{key}' must be a non-empty string in {source_label}"
             )
+        resolved_upstream[key] = str(resolve_config_path(resolved_base, val.strip()))
 
     if "start_date" not in config:
         raise ValueError(f"Missing required config key 'start_date' in {source_label}")
@@ -925,16 +950,18 @@ def _validate_sim_config(config: Mapping[str, Any], source_label: str) -> dict[s
             f"'universe.sectors' must be a non-empty list of symbol strings in {source_label}"
         )
 
-    return dict(config)
+    normalized = dict(config)
+    normalized["upstream_paths"] = resolved_upstream
+    return normalized
 
 
 def load_sim_config(
     config_path: str | Path = DEFAULT_SIM_CONFIG_PATH,
 ) -> dict[str, Any]:
     """Load and validate sim_config.json."""
-    path = Path(config_path)
+    path = Path(config_path).resolve()
     raw = _read_json_object(path, "sim_config")
-    return _validate_sim_config(raw, str(path))
+    return _validate_sim_config(raw, str(path), base_root=_infer_repo_root(path))
 
 
 def find_latest_tdx_csv(tdx_daily_dir: str | Path, symbol: str) -> Path:

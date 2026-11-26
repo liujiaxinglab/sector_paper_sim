@@ -9,7 +9,9 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import shutil
 import subprocess
+import sys
 
 import pytest
 
@@ -41,7 +43,7 @@ GRID = "510720.SH"
 TREND = "512400.SH"
 SPLIT = "512480.SH"
 UNRATED = "512880.SH"
-QUANT_PYTHON = "C:/Users/jxing/.conda/envs/quant/python.exe"
+QUANT_PYTHON = sys.executable
 
 
 def write_json(path, payload):
@@ -1147,3 +1149,99 @@ def test_cli_formal_rejects_missing_ledger_anchor_empty_sha_or_tampered_text_wit
     # 5. Restored valid text passes formal CLI cleanly
     decisions_path.write_text(valid_decisions, encoding="utf-8")
     assert cli_main(inputs.args(out_resume, as_of=inputs.dates[1])) == 0
+
+
+def test_relocated_sibling_workspace_cli_works_from_repo_root_and_external_cwd(tmp_path):
+    """Copy code and relative sim_config.json into a relocated sibling workspace and run CLI without --config/--output-dir."""
+    inputs = make_inputs(tmp_path, include_live_records=False)
+    ws_root = tmp_path / "relocated_ws" / "nested"
+    sim_repo = ws_root / "sector_paper_sim"
+    radar_repo = ws_root / "sector_radar"
+    qd_root = ws_root / "QuantData"
+    unrelated_cwd = tmp_path / "unrelated_cwd"
+    unrelated_cwd.mkdir(parents=True, exist_ok=True)
+
+    src_repo_root = DEFAULT_SIM_CONFIG_PATH.parents[2]
+    dst_src = sim_repo / "project_content" / "src"
+    shutil.copytree(src_repo_root / "project_content" / "src", dst_src)
+    dst_cfg = sim_repo / "project_content" / "config" / "sim_config.json"
+    dst_cfg.parent.mkdir(parents=True, exist_ok=True)
+    sim_cfg = json.loads(DEFAULT_SIM_CONFIG_PATH.read_text(encoding="utf-8"))
+    sim_cfg["backfill_replay_window"] = {"start_date": START, "end_date": inputs.dates[2]}
+    sim_cfg["forward_eval_start_date"] = None
+    write_json(dst_cfg, sim_cfg)
+
+    for sym_dir in (tmp_path / "bars").iterdir():
+        sym_dst = qd_root / "raw" / "tdx" / "vipdoc_parsed" / sym_dir.name
+        sym_dst.mkdir(parents=True, exist_ok=True)
+        for csv_file in sym_dir.glob("*.csv"):
+            shutil.copy2(csv_file, sym_dst / csv_file.name)
+    cal_dst = qd_root / "raw" / "baostock" / "query_trade_dates" / inputs.calendar.name
+    cal_dst.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(inputs.calendar, cal_dst)
+    ledger_dst = qd_root / "reference" / "etf" / "corporate_actions" / "latest" / "corporate_actions_ledger.json"
+    ledger_dst.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(inputs.ledger, ledger_dst)
+
+    regime_dst = radar_repo / "project_content" / "journal" / "regime_history.json"
+    regime_dst.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(inputs.regimes, regime_dst)
+    watchlist_dst = radar_repo / "project_content" / "config" / "watchlist.json"
+    watchlist_dst.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(inputs.watchlist, watchlist_dst)
+
+    env = {**os.environ, "PYTHONUTF8": "1", "PYTHONDONTWRITEBYTECODE": "1"}
+    help_proc = subprocess.run(
+        [sys.executable, "project_content/src/run_daily_sim.py", "--help"],
+        cwd=sim_repo,
+        env=env,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        check=False,
+    )
+    assert help_proc.returncode == 0, help_proc.stderr
+    assert "--config" in help_proc.stdout and "--output-dir" in help_proc.stdout and "--mode" in help_proc.stdout
+
+    root_run = subprocess.run(
+        [
+            sys.executable,
+            "project_content/src/run_daily_sim.py",
+            "--mode",
+            "replay",
+            "--from-scratch",
+            "--as-of",
+            inputs.dates[1],
+        ],
+        cwd=sim_repo,
+        env=env,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        check=False,
+    )
+    assert root_run.returncode == 0, root_run.stderr
+    relocated_output = sim_repo / "project_content" / "output"
+    assert (relocated_output / "state.json").is_file()
+    assert (relocated_output / "nav_daily.csv").is_file()
+
+    ext_dry = subprocess.run(
+        [
+            sys.executable,
+            str(dst_src / "run_daily_sim.py"),
+            "--mode",
+            "replay",
+            "--as-of",
+            inputs.dates[2],
+            "--dry-run",
+        ],
+        cwd=unrelated_cwd,
+        env=env,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        check=False,
+    )
+    assert ext_dry.returncode == 0, ext_dry.stderr
+    assert "[DRY-RUN]" in ext_dry.stdout and inputs.dates[2] in ext_dry.stdout
+    assert list(unrelated_cwd.iterdir()) == []
