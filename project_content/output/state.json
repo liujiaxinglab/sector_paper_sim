@@ -1,26 +1,27 @@
 {
   "schema_version": "2.0.0",
   "start_date": "2026-11-23",
-  "last_processed_date": "2026-11-25",
+  "last_processed_date": "2026-11-26",
   "last_known_closes": {
-    "159330.SZ": 1.229,
-    "159622.SZ": 1.054,
-    "510720.SH": 0.993,
-    "512400.SH": 1.213,
-    "512480.SH": 0.708,
-    "512880.SH": 0.955,
-    "515790.SH": 0.624
+    "159330.SZ": 1.227,
+    "159622.SZ": 1.062,
+    "510720.SH": 1.007,
+    "512400.SH": 1.233,
+    "512480.SH": 0.696,
+    "512880.SH": 0.943,
+    "515790.SH": 0.619
   },
   "routing_checkpoint": {
-    "verified_through_date": "2026-11-25",
-    "verified_replay_through_date": "2026-11-25",
+    "verified_through_date": "2026-11-26",
+    "verified_replay_through_date": "2026-11-26",
     "verified_replay_dates": [
       "2026-11-23",
       "2026-11-24",
-      "2026-11-25"
+      "2026-11-25",
+      "2026-11-26"
     ],
-    "verified_backfill_count": 2,
-    "verified_backfill_digest": "d681f702d67911eb6ba4750fcb16b0d95fd99afad067d63e61a5b9668ae25495"
+    "verified_backfill_count": 6,
+    "verified_backfill_digest": "cb6657504d068cfb078e35a522621a6ddfcafc55b5f96681ac3a000c5de14753"
   },
   "accounts": {
     "A": {
@@ -113,19 +114,19 @@
       "symbol_states": {}
     },
     "B2": {
-      "cash": 48611.172051647605,
-      "equity": 99777.7720516476,
-      "nav": 0.997777720516476,
+      "cash": 46473.42272674298,
+      "equity": 99787.42272674298,
+      "nav": 0.9978742272674298,
       "peak_equity": 101021.5477,
       "max_drawdown": -0.012311983697240403,
-      "next_trade_id": 16,
+      "next_trade_id": 19,
       "positions": {
         "159622.SZ": {
           "shares": 6100,
           "avg_cost": 1.0212042000000001
         },
         "510720.SH": {
-          "shares": 10200,
+          "shares": 8200,
           "avg_cost": 1.0050416427148874
         },
         "512400.SH": {
@@ -133,12 +134,12 @@
           "avg_cost": 1.2367473
         },
         "512480.SH": {
-          "shares": 11300,
-          "avg_cost": 0.7321464
+          "shares": 14300,
+          "avg_cost": 0.7234047637227202
         },
         "512880.SH": {
-          "shares": 10600,
-          "avg_cost": 0.9768407332698632
+          "shares": 12800,
+          "avg_cost": 0.9715956325258027
         },
         "515790.SH": {
           "shares": 13200,
@@ -230,10 +231,10 @@
                 "shares": 0
               },
               {
-                "side": "SELL",
-                "level": 0,
-                "price": 1.008,
-                "shares": 2000
+                "side": "BUY",
+                "level": -1,
+                "price": 0.9918874403578529,
+                "shares": 0
               },
               {
                 "side": "SELL",
@@ -346,10 +347,10 @@
                 "shares": 0
               },
               {
-                "side": "BUY",
-                "level": -1,
-                "price": 0.6903398657718121,
-                "shares": 0
+                "side": "SELL",
+                "level": 0,
+                "price": 0.732,
+                "shares": 3000
               },
               {
                 "side": "SELL",
@@ -398,10 +399,10 @@
                 "shares": 0
               },
               {
-                "side": "BUY",
-                "level": -2,
-                "price": 0.9461345565749235,
-                "shares": 0
+                "side": "SELL",
+                "level": -1,
+                "price": 0.9630672782874617,
+                "shares": 2200
               },
               {
                 "side": "SELL",
@@ -498,8 +499,8 @@
     },
     "C": {
       "cash": 180.94017999998687,
-      "equity": 98780.04018,
-      "nav": 0.9878004018,
+      "equity": 98801.04018,
+      "nav": 0.9880104018,
       "peak_equity": 102049.14017999999,
       "max_drawdown": -0.03203456681980632,
       "next_trade_id": 7,
@@ -552,10 +553,10 @@
     },
     "D": {
       "cash": 68.5176999999967,
-      "equity": 99494.6177,
-      "nav": 0.994946177,
+      "equity": 99332.8177,
+      "nav": 0.993328177,
       "peak_equity": 101193.5177,
-      "max_drawdown": -0.01678862479152654,
+      "max_drawdown": -0.01838754143833854,
       "next_trade_id": 2,
       "positions": {
         "159330.SZ": {
@@ -572,5 +573,5 @@
   },
   "experiment_id": "exp-4e9b5ec996a109c43318",
   "experiment_manifest_sha256": "d0b4ce879ae50aa1bff0327c1c0387dc56d396376df3b2525c2305bb9dd58115",
-  "daily_input_manifest_chain_sha256": "76b824952eb20fcd43bfe18a7393d9f95b56fbbb91c37ee4538d1c264ba17bd5"
+  "daily_input_manifest_chain_sha256": "6706037b36122eb6c2113c5c47b24ac064ac01264ddbc064bf51cef89faa8c69"
 }
