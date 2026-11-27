@@ -570,7 +570,7 @@
       }
     }
   },
-  "experiment_id": "exp-9daea42ec2c2d655ddd2",
-  "experiment_manifest_sha256": "df6ab61fa1e4c6cde9e4b114d5bdea62c94cb7460b660d84ae738bb4211b0703",
-  "daily_input_manifest_chain_sha256": "7309f7e9cd3412b2cf6e5e3c1f0cd70c9f19cc67b04011066db23453166fbe6e"
+  "experiment_id": "exp-806691e93bcded5fcd3c",
+  "experiment_manifest_sha256": "21287c1f5c53619c3bc9d739a3141fe325f0116974dc593529ab411f13a638d9",
+  "daily_input_manifest_chain_sha256": "80633ba962d9d794bb02c7e777c806165cea645405872628f6a6a6fae33e6504"
 }

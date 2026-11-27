@@ -1,0 +1,87 @@
+{
+  "schema_version": "1.0.0",
+  "experiment_id": "exp-9daea42ec2c2d655ddd2",
+  "run_date": "2026-11-24",
+  "trade_date": "2026-11-24",
+  "run_mode": "replay",
+  "allow_lag": false,
+  "forward_eval_start_date": null,
+  "inputs": {
+    "tdx_batches": [
+      {
+        "path": "QuantData/raw/tdx/vipdoc_parsed/159330.SZ/20261126_100337.csv",
+        "file_name": "20261126_100337.csv",
+        "sha256": "74b32b49af8b34faebf3a7bc90642c69b2fd8e07d0811d82cf55107ee6ccc2fa",
+        "symbol": "159330.SZ",
+        "data_through": "2026-11-24"
+      },
+      {
+        "path": "QuantData/raw/tdx/vipdoc_parsed/512400.SH/20261126_100337.csv",
+        "file_name": "20261126_100337.csv",
+        "sha256": "156a7556c62bc00d6c64cf5f3c0631dd1791e38d1fe6d70932a7fa774da2ff3f",
+        "symbol": "512400.SH",
+        "data_through": "2026-11-24"
+      },
+      {
+        "path": "QuantData/raw/tdx/vipdoc_parsed/510720.SH/20261126_151552.csv",
+        "file_name": "20261126_151552.csv",
+        "sha256": "78e554fe88eaf7743eeb720d3b8261326a66d86a3bb253e06deebffba2ead000",
+        "symbol": "510720.SH",
+        "data_through": "2026-11-24"
+      },
+      {
+        "path": "QuantData/raw/tdx/vipdoc_parsed/159622.SZ/20261126_100337.csv",
+        "file_name": "20261126_100337.csv",
+        "sha256": "eb87fbba5ae6a7ac05f6ad0ded397f5d2fd41297e6100da4443d319f5091e03e",
+        "symbol": "159622.SZ",
+        "data_through": "2026-11-24"
+      },
+      {
+        "path": "QuantData/raw/tdx/vipdoc_parsed/515790.SH/20261126_100337.csv",
+        "file_name": "20261126_100337.csv",
+        "sha256": "345127db77fdeda7826aa41a070c7cf2b7bd86122b2912e33ef5474d15dccffb",
+        "symbol": "515790.SH",
+        "data_through": "2026-11-24"
+      },
+      {
+        "path": "QuantData/raw/tdx/vipdoc_parsed/512480.SH/20261126_100337.csv",
+        "file_name": "20261126_100337.csv",
+        "sha256": "eca1436dc7fd572ff886c73ee7bee6993996beb549b096ded2f68b74e9f43ee1",
+        "symbol": "512480.SH",
+        "data_through": "2026-11-24"
+      },
+      {
+        "path": "QuantData/raw/tdx/vipdoc_parsed/512880.SH/20261126_100337.csv",
+        "file_name": "20261126_100337.csv",
+        "sha256": "d5b075a5d4deb11fd992d616e292a35a1a4dd277b34e48bf50de1c070169335b",
+        "symbol": "512880.SH",
+        "data_through": "2026-11-24"
+      }
+    ],
+    "trade_calendar": {
+      "path": "QuantData/raw/baostock/query_trade_dates/20261126_100336.csv",
+      "file_name": "20261126_100336.csv",
+      "sha256": "1483de72e1a3f29b9734967f067201fa36737723b329b3ebbc8dbb92b3e4d550",
+      "schema": "BS-01 calendar_date,is_trading_day",
+      "coverage_through": "2026-11-24"
+    },
+    "corporate_actions_ledger": {
+      "path": "QuantData/reference/etf/corporate_actions/latest/corporate_actions_ledger.json",
+      "file_name": "corporate_actions_ledger.json",
+      "sha256": "6cce452142084e450d26bced936f88ec42499cca169bed4412c2744b4d764c05",
+      "as_of": "2026-11-26",
+      "schema_version": "2.0.0"
+    },
+    "regime_history": {
+      "path": "sector_radar/project_content/journal/regime_history.json",
+      "file_name": "regime_history.json",
+      "sha256": "32203a99444217898b14cbd694ef688f6c941f168adad5963b6bb640fa60074d",
+      "schema_version": "2.0.0"
+    },
+    "watchlist": {
+      "path": "sector_radar/project_content/config/watchlist.json",
+      "file_name": "watchlist.json",
+      "sha256": "039e404d46f3f1ba5b372d879b66d4032fe2645c2630937be485e211ae617769"
+    }
+  }
+}

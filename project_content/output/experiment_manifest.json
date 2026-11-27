@@ -1,6 +1,6 @@
 {
   "schema_version": "1.0.0",
-  "experiment_id": "exp-9daea42ec2c2d655ddd2",
+  "experiment_id": "exp-806691e93bcded5fcd3c",
   "simulation_start_date": "2026-11-23",
   "initial_capital": 100000.0,
   "config_snapshot": {
@@ -103,11 +103,11 @@
   "program_commit": "d81e93b892d2210e798c122ca8064dc484dbbffd",
   "program_source_sha256": "99a54900812efee74839ea28936bee04672b2bcfb22ce778fa228853986e610d",
   "rules_version": "2.0.0",
-  "rules_sha256": "b763d31f108a04c85382dda9d5972ed3ae5e0995a943c97d68be94f65f9a8896",
+  "rules_sha256": "8befdfaa127c9fff73f6178659e9748918ef680a21503001e7eea852f2a0d4f2",
   "initialization_run_mode": "replay",
   "initialization_input_version": {
     "trade_date": "2026-11-23",
-    "sha256": "694085c490462183cf60eb5291f15b849a5ffa2ab5683076e88df722d12336d1",
+    "sha256": "4f91bdcd0e3d5f6a5ff1528df21ab1a3aaf15114a23c881a88ffd8043ebfb566",
     "inputs": {
       "tdx_batches": [
         {
@@ -183,7 +183,7 @@
       "watchlist": {
         "path": "sector_radar/project_content/config/watchlist.json",
         "file_name": "watchlist.json",
-        "sha256": "039e404d46f3f1ba5b372d879b66d4032fe2645c2630937be485e211ae617769"
+        "sha256": "469143068a15d498ddf392b80abb4342a9dc1834ec9fc47f3f4c86f892ca841a"
       }
     }
   }
