@@ -325,7 +325,7 @@ def test_daily_outputs_have_five_accounts_and_keep_only_the_checkpoint(tmp_path,
         assert payload["experiment_id"] == manifest["experiment_id"]
         assert payload["run_date"] == payload["trade_date"] == day
         assert payload["allow_lag"] is False
-        assert payload["forward_eval_start_date"] is None
+        assert payload["forward_eval_start_date"] == manifest["config_snapshot"]["forward_eval_start_date"]
         assert len(payload["inputs"]["tdx_batches"]) == len(SECTORS) + 1
         assert all(len(item["sha256"]) == 64 for item in payload["inputs"]["tdx_batches"])
         assert payload["inputs"]["trade_calendar"]["file_name"].endswith(".csv")
