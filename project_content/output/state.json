@@ -11,6 +11,17 @@
     "512880.SH": 0.955,
     "515790.SH": 0.624
   },
+  "routing_checkpoint": {
+    "verified_through_date": "2026-11-25",
+    "verified_replay_through_date": "2026-11-25",
+    "verified_replay_dates": [
+      "2026-11-23",
+      "2026-11-24",
+      "2026-11-25"
+    ],
+    "verified_backfill_count": 2,
+    "verified_backfill_digest": "d681f702d67911eb6ba4750fcb16b0d95fd99afad067d63e61a5b9668ae25495"
+  },
   "accounts": {
     "A": {
       "cash": 100000.0,
@@ -558,5 +569,8 @@
         }
       }
     }
-  }
+  },
+  "experiment_id": "exp-9daea42ec2c2d655ddd2",
+  "experiment_manifest_sha256": "df6ab61fa1e4c6cde9e4b114d5bdea62c94cb7460b660d84ae738bb4211b0703",
+  "daily_input_manifest_chain_sha256": "7309f7e9cd3412b2cf6e5e3c1f0cd70c9f19cc67b04011066db23453166fbe6e"
 }

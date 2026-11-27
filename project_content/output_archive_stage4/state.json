@@ -1,0 +1,562 @@
+{
+  "schema_version": "2.0.0",
+  "start_date": "2026-11-23",
+  "last_processed_date": "2026-11-25",
+  "last_known_closes": {
+    "159330.SZ": 1.229,
+    "159622.SZ": 1.054,
+    "510720.SH": 0.993,
+    "512400.SH": 1.213,
+    "512480.SH": 0.708,
+    "512880.SH": 0.955,
+    "515790.SH": 0.624
+  },
+  "accounts": {
+    "A": {
+      "cash": 100000.0,
+      "equity": 100000.0,
+      "nav": 1.0,
+      "peak_equity": 100000.0,
+      "max_drawdown": 0.0,
+      "next_trade_id": 1,
+      "positions": {
+        "159622.SZ": {
+          "shares": 0,
+          "avg_cost": 0.0
+        },
+        "510720.SH": {
+          "shares": 0,
+          "avg_cost": 0.0
+        },
+        "512400.SH": {
+          "shares": 0,
+          "avg_cost": 0.0
+        },
+        "512480.SH": {
+          "shares": 0,
+          "avg_cost": 0.0
+        },
+        "512880.SH": {
+          "shares": 0,
+          "avg_cost": 0.0
+        },
+        "515790.SH": {
+          "shares": 0,
+          "avg_cost": 0.0
+        }
+      },
+      "symbol_states": {
+        "159622.SZ": {
+          "active_regime": "TRANSITION"
+        },
+        "510720.SH": {
+          "active_regime": "TRANSITION"
+        },
+        "512400.SH": {
+          "active_regime": "TRANSITION"
+        },
+        "512480.SH": {
+          "active_regime": "TRANSITION"
+        },
+        "512880.SH": {
+          "active_regime": "TRANSITION"
+        },
+        "515790.SH": {
+          "active_regime": "TRAP_OFF"
+        }
+      }
+    },
+    "B1": {
+      "cash": 100000.0,
+      "equity": 100000.0,
+      "nav": 1.0,
+      "peak_equity": 100000.0,
+      "max_drawdown": 0.0,
+      "next_trade_id": 1,
+      "positions": {
+        "159622.SZ": {
+          "shares": 0,
+          "avg_cost": 0.0
+        },
+        "510720.SH": {
+          "shares": 0,
+          "avg_cost": 0.0
+        },
+        "512400.SH": {
+          "shares": 0,
+          "avg_cost": 0.0
+        },
+        "512480.SH": {
+          "shares": 0,
+          "avg_cost": 0.0
+        },
+        "512880.SH": {
+          "shares": 0,
+          "avg_cost": 0.0
+        },
+        "515790.SH": {
+          "shares": 0,
+          "avg_cost": 0.0
+        }
+      },
+      "symbol_states": {}
+    },
+    "B2": {
+      "cash": 48611.172051647605,
+      "equity": 99777.7720516476,
+      "nav": 0.997777720516476,
+      "peak_equity": 101021.5477,
+      "max_drawdown": -0.012311983697240403,
+      "next_trade_id": 16,
+      "positions": {
+        "159622.SZ": {
+          "shares": 6100,
+          "avg_cost": 1.0212042000000001
+        },
+        "510720.SH": {
+          "shares": 10200,
+          "avg_cost": 1.0050416427148874
+        },
+        "512400.SH": {
+          "shares": 6800,
+          "avg_cost": 1.2367473
+        },
+        "512480.SH": {
+          "shares": 11300,
+          "avg_cost": 0.7321464
+        },
+        "512880.SH": {
+          "shares": 10600,
+          "avg_cost": 0.9768407332698632
+        },
+        "515790.SH": {
+          "shares": 13200,
+          "avg_cost": 0.6291258
+        }
+      },
+      "symbol_states": {
+        "159622.SZ": {
+          "grid": {
+            "anchor_price": 1.021,
+            "step": 0.03628019323671499,
+            "slice_budget": 2083.3333333333335,
+            "initialized_date": "2026-11-23",
+            "pending_orders": [
+              {
+                "side": "BUY",
+                "level": -4,
+                "price": 0.872831690821256,
+                "shares": 0
+              },
+              {
+                "side": "BUY",
+                "level": -3,
+                "price": 0.909873768115942,
+                "shares": 0
+              },
+              {
+                "side": "BUY",
+                "level": -2,
+                "price": 0.946915845410628,
+                "shares": 0
+              },
+              {
+                "side": "BUY",
+                "level": -1,
+                "price": 0.983957922705314,
+                "shares": 0
+              },
+              {
+                "side": "BUY",
+                "level": 0,
+                "price": 1.021,
+                "shares": 0
+              },
+              {
+                "side": "SELL",
+                "level": 2,
+                "price": 1.095084154589372,
+                "shares": 2000
+              },
+              {
+                "side": "SELL",
+                "level": 3,
+                "price": 1.132126231884058,
+                "shares": 2000
+              },
+              {
+                "side": "SELL",
+                "level": 4,
+                "price": 1.169168309178744,
+                "shares": 2100
+              }
+            ]
+          }
+        },
+        "510720.SH": {
+          "grid": {
+            "anchor_price": 1.008,
+            "step": 0.015984682184669773,
+            "slice_budget": 2083.3333333333335,
+            "initialized_date": "2026-11-23",
+            "pending_orders": [
+              {
+                "side": "BUY",
+                "level": -4,
+                "price": 0.9435497614314114,
+                "shares": 0
+              },
+              {
+                "side": "BUY",
+                "level": -3,
+                "price": 0.9596623210735586,
+                "shares": 0
+              },
+              {
+                "side": "BUY",
+                "level": -2,
+                "price": 0.9757748807157057,
+                "shares": 0
+              },
+              {
+                "side": "SELL",
+                "level": 0,
+                "price": 1.008,
+                "shares": 2000
+              },
+              {
+                "side": "SELL",
+                "level": 1,
+                "price": 1.0241125596421472,
+                "shares": 2000
+              },
+              {
+                "side": "SELL",
+                "level": 2,
+                "price": 1.0402251192842942,
+                "shares": 2000
+              },
+              {
+                "side": "SELL",
+                "level": 3,
+                "price": 1.0563376789264414,
+                "shares": 2100
+              },
+              {
+                "side": "SELL",
+                "level": 4,
+                "price": 1.0724502385685886,
+                "shares": 2100
+              }
+            ]
+          }
+        },
+        "512400.SH": {
+          "grid": {
+            "anchor_price": 1.242,
+            "step": 0.03695652173913045,
+            "slice_budget": 2083.3333333333335,
+            "initialized_date": "2026-11-23",
+            "pending_orders": [
+              {
+                "side": "BUY",
+                "level": -4,
+                "price": 1.0584,
+                "shares": 0
+              },
+              {
+                "side": "BUY",
+                "level": -3,
+                "price": 1.1042999999999998,
+                "shares": 0
+              },
+              {
+                "side": "BUY",
+                "level": -2,
+                "price": 1.1502,
+                "shares": 0
+              },
+              {
+                "side": "BUY",
+                "level": -1,
+                "price": 1.1961,
+                "shares": 0
+              },
+              {
+                "side": "SELL",
+                "level": 1,
+                "price": 1.2879,
+                "shares": 1700
+              },
+              {
+                "side": "SELL",
+                "level": 2,
+                "price": 1.3338,
+                "shares": 1700
+              },
+              {
+                "side": "SELL",
+                "level": 3,
+                "price": 1.3797000000000001,
+                "shares": 1700
+              },
+              {
+                "side": "SELL",
+                "level": 4,
+                "price": 1.4256,
+                "shares": 1700
+              }
+            ]
+          }
+        },
+        "512480.SH": {
+          "grid": {
+            "anchor_price": 0.732,
+            "step": 0.05691275167785236,
+            "slice_budget": 2083.3333333333335,
+            "initialized_date": "2026-11-23",
+            "pending_orders": [
+              {
+                "side": "BUY",
+                "level": -4,
+                "price": 0.5653594630872483,
+                "shares": 0
+              },
+              {
+                "side": "BUY",
+                "level": -3,
+                "price": 0.6070195973154362,
+                "shares": 0
+              },
+              {
+                "side": "BUY",
+                "level": -2,
+                "price": 0.6486797315436241,
+                "shares": 0
+              },
+              {
+                "side": "BUY",
+                "level": -1,
+                "price": 0.6903398657718121,
+                "shares": 0
+              },
+              {
+                "side": "SELL",
+                "level": 1,
+                "price": 0.7736601342281879,
+                "shares": 2800
+              },
+              {
+                "side": "SELL",
+                "level": 2,
+                "price": 0.8153202684563758,
+                "shares": 2800
+              },
+              {
+                "side": "SELL",
+                "level": 3,
+                "price": 0.8569804026845638,
+                "shares": 2800
+              },
+              {
+                "side": "SELL",
+                "level": 4,
+                "price": 0.8986405369127517,
+                "shares": 2900
+              }
+            ]
+          }
+        },
+        "512880.SH": {
+          "grid": {
+            "anchor_price": 0.98,
+            "step": 0.01727828746177371,
+            "slice_budget": 2083.3333333333335,
+            "initialized_date": "2026-11-23",
+            "pending_orders": [
+              {
+                "side": "BUY",
+                "level": -4,
+                "price": 0.912269113149847,
+                "shares": 0
+              },
+              {
+                "side": "BUY",
+                "level": -3,
+                "price": 0.9292018348623853,
+                "shares": 0
+              },
+              {
+                "side": "BUY",
+                "level": -2,
+                "price": 0.9461345565749235,
+                "shares": 0
+              },
+              {
+                "side": "SELL",
+                "level": 0,
+                "price": 0.98,
+                "shares": 2100
+              },
+              {
+                "side": "SELL",
+                "level": 1,
+                "price": 0.9969327217125382,
+                "shares": 2100
+              },
+              {
+                "side": "SELL",
+                "level": 2,
+                "price": 1.0138654434250765,
+                "shares": 2100
+              },
+              {
+                "side": "SELL",
+                "level": 3,
+                "price": 1.0307981651376148,
+                "shares": 2100
+              },
+              {
+                "side": "SELL",
+                "level": 4,
+                "price": 1.047730886850153,
+                "shares": 2200
+              }
+            ]
+          }
+        },
+        "515790.SH": {
+          "grid": {
+            "anchor_price": 0.629,
+            "step": 0.03700787401574803,
+            "slice_budget": 2083.3333333333335,
+            "initialized_date": "2026-11-23",
+            "pending_orders": [
+              {
+                "side": "BUY",
+                "level": -4,
+                "price": 0.5358881889763779,
+                "shares": 0
+              },
+              {
+                "side": "BUY",
+                "level": -3,
+                "price": 0.5591661417322835,
+                "shares": 0
+              },
+              {
+                "side": "BUY",
+                "level": -2,
+                "price": 0.582444094488189,
+                "shares": 0
+              },
+              {
+                "side": "BUY",
+                "level": -1,
+                "price": 0.6057220472440945,
+                "shares": 0
+              },
+              {
+                "side": "SELL",
+                "level": 1,
+                "price": 0.6522779527559055,
+                "shares": 3300
+              },
+              {
+                "side": "SELL",
+                "level": 2,
+                "price": 0.675555905511811,
+                "shares": 3300
+              },
+              {
+                "side": "SELL",
+                "level": 3,
+                "price": 0.6988338582677165,
+                "shares": 3300
+              },
+              {
+                "side": "SELL",
+                "level": 4,
+                "price": 0.7221118110236221,
+                "shares": 3300
+              }
+            ]
+          }
+        }
+      }
+    },
+    "C": {
+      "cash": 180.94017999998687,
+      "equity": 98780.04018,
+      "nav": 0.9878004018,
+      "peak_equity": 102049.14017999999,
+      "max_drawdown": -0.03203456681980632,
+      "next_trade_id": 7,
+      "positions": {
+        "159622.SZ": {
+          "shares": 16300,
+          "avg_cost": 1.0212042
+        },
+        "510720.SH": {
+          "shares": 16500,
+          "avg_cost": 1.0082016
+        },
+        "512400.SH": {
+          "shares": 13400,
+          "avg_cost": 1.2422484
+        },
+        "512480.SH": {
+          "shares": 22700,
+          "avg_cost": 0.7321464000000001
+        },
+        "512880.SH": {
+          "shares": 17000,
+          "avg_cost": 0.980196
+        },
+        "515790.SH": {
+          "shares": 26400,
+          "avg_cost": 0.6291258
+        }
+      },
+      "symbol_states": {
+        "159622.SZ": {
+          "bh_initialized": true
+        },
+        "510720.SH": {
+          "bh_initialized": true
+        },
+        "512400.SH": {
+          "bh_initialized": true
+        },
+        "512480.SH": {
+          "bh_initialized": true
+        },
+        "512880.SH": {
+          "bh_initialized": true
+        },
+        "515790.SH": {
+          "bh_initialized": true
+        }
+      }
+    },
+    "D": {
+      "cash": 68.5176999999967,
+      "equity": 99494.6177,
+      "nav": 0.994946177,
+      "peak_equity": 101193.5177,
+      "max_drawdown": -0.01678862479152654,
+      "next_trade_id": 2,
+      "positions": {
+        "159330.SZ": {
+          "shares": 80900,
+          "avg_cost": 1.235247
+        }
+      },
+      "symbol_states": {
+        "159330.SZ": {
+          "bh_initialized": true
+        }
+      }
+    }
+  }
+}
