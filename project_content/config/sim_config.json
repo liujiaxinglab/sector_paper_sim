@@ -5,7 +5,7 @@
     "start_date": "2026-11-23",
     "end_date": "2026-11-26"
   },
-  "forward_eval_start_date": null,
+  "forward_eval_start_date": "2026-11-27",
   "upstream_paths": {
     "tdx_daily_dir": "../QuantData/raw/tdx/vipdoc_parsed",
     "trade_calendar_dir": "../QuantData/raw/baostock/query_trade_dates",
