@@ -168,8 +168,19 @@ def test_real_market_bundle_uses_bs01_calendar_and_ledger() -> None:
     assert set(bundle.sectors) == set(EXPECTED_SYMBOLS[1:])
     assert set(bundle.symbols) == set(EXPECTED_SYMBOLS)
     assert set(bundle.bars) == set(EXPECTED_SYMBOLS)
-    assert bundle.metadata["calendar_file"].endswith("20261126_100336.csv")
-    assert bundle.metadata["corporate_actions_as_of"] == "2026-11-26"
+    calendar_file = Path(bundle.metadata["calendar_file"])
+    assert calendar_file.is_file()
+    assert datetime.strptime(
+        calendar_file.name, "%Y%m%d_%H%M%S.csv"
+    ).strftime("%Y%m%d_%H%M%S.csv") == calendar_file.name
+    corporate_actions_as_of = bundle.metadata["corporate_actions_as_of"]
+    corporate_actions_as_of_date = date.fromisoformat(corporate_actions_as_of)
+    assert corporate_actions_as_of_date.isoformat() == corporate_actions_as_of
+    configured_start_date = date.fromisoformat(
+        load_sim_config(DEFAULT_SIM_CONFIG_PATH)["start_date"]
+    )
+    assert corporate_actions_as_of_date >= date.fromisoformat(bundle.common_end_date)
+    assert corporate_actions_as_of_date >= configured_start_date
     assert bundle.regime_history.anchor_start_date == "2026-11-23"
     assert bundle.authoritative_trading_dates == sorted(
         bundle.authoritative_trading_dates

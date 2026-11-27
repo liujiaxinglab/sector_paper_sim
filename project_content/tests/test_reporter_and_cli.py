@@ -360,6 +360,49 @@ def test_from_scratch_matches_every_day_incremental_byte_for_byte(tmp_path):
     assert output_bytes(incremental) == before
 
 
+def test_resume_records_rolling_upstream_batches_without_manifest_drift(tmp_path):
+    inputs = make_inputs(tmp_path)
+    output = tmp_path / "output"
+
+    ledger = json.loads(inputs.ledger.read_text(encoding="utf-8"))
+    ledger["as_of"] = inputs.dates[0]
+    write_json(inputs.ledger, ledger)
+    assert cli_main(inputs.args(output, as_of=inputs.dates[0])) == 0
+
+    manifest_path = output / "experiment_manifest.json"
+    initial_manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    first_input_path = output / "daily_inputs" / f"inputs_{inputs.dates[0].replace('-', '')}.json"
+    first_inputs = json.loads(first_input_path.read_text(encoding="utf-8"))["inputs"]
+
+    upstream = json.loads(inputs.config.read_text(encoding="utf-8"))["upstream_paths"]
+    tdx_dir = Path(upstream["tdx_daily_dir"])
+    rolled_tdx_file_name = "20261209_180000.csv"
+    for symbol in (BENCHMARK, *SECTORS):
+        current_batch = next((tdx_dir / symbol).glob("*.csv"))
+        shutil.copyfile(current_batch, current_batch.with_name(rolled_tdx_file_name))
+    rolled_calendar_file_name = "20261209_193000.csv"
+    shutil.copyfile(inputs.calendar, inputs.calendar.with_name(rolled_calendar_file_name))
+    ledger["as_of"] = inputs.dates[1]
+    write_json(inputs.ledger, ledger)
+
+    assert cli_main(inputs.args(output, as_of=inputs.dates[1])) == 0
+
+    second_input_path = output / "daily_inputs" / f"inputs_{inputs.dates[1].replace('-', '')}.json"
+    second_inputs = json.loads(second_input_path.read_text(encoding="utf-8"))["inputs"]
+    assert first_inputs["trade_calendar"]["file_name"] == inputs.calendar.name
+    assert first_inputs["corporate_actions_ledger"]["as_of"] == inputs.dates[0]
+    assert {item["file_name"] for item in first_inputs["tdx_batches"]} == {
+        "20261208_180000.csv"
+    }
+    assert second_inputs["trade_calendar"]["file_name"] == rolled_calendar_file_name
+    assert second_inputs["corporate_actions_ledger"]["as_of"] == inputs.dates[1]
+    assert {item["file_name"] for item in second_inputs["tdx_batches"]} == {
+        rolled_tdx_file_name
+    }
+    assert json.loads(manifest_path.read_text(encoding="utf-8")) == initial_manifest
+    assert load_state_json(output / "state.json")["last_processed_date"] == inputs.dates[1]
+
+
 def test_history_routes_activate_on_effective_day_and_ignore_current_watchlist(tmp_path):
     inputs = make_inputs(tmp_path)
     output = tmp_path / "output"
