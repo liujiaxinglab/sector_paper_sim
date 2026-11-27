@@ -576,6 +576,24 @@ def test_resume_blocks_changed_experiment_configuration_without_writing(tmp_path
     assert output_bytes(output) == before
 
 
+def test_resume_ignores_non_matching_config_formatting_and_rules_doc_hash(tmp_path):
+    inputs = make_inputs(tmp_path)
+    output = tmp_path / "output"
+    assert cli_main(inputs.args(output, as_of=inputs.dates[1])) == 0
+    manifest_before = json.loads((output / "experiment_manifest.json").read_text(encoding="utf-8"))
+    from src.experiment_manifest import RULES_VERSION, sha256_bytes
+    assert manifest_before["rules_sha256"] == sha256_bytes(RULES_VERSION.encode("utf-8"))
+
+    # Reformatting sim_config.json (different raw config_sha256) or changing non-strategy fields
+    # must not block resume when core strategy/fee parameters and source code are unchanged.
+    raw_cfg = json.loads(inputs.config.read_text(encoding="utf-8"))
+    raw_cfg["project_name"] = "sector_paper_sim_relocated"
+    inputs.config.write_text(
+        json.dumps(raw_cfg, ensure_ascii=False, indent=4) + "\n", encoding="utf-8", newline="\n"
+    )
+    assert cli_main(inputs.args(output, as_of=inputs.dates[2])) == 0
+
+
 def test_resume_blocks_unapproved_program_commit_in_manifest(tmp_path, capsys):
     inputs = make_inputs(tmp_path)
     output = tmp_path / "output"

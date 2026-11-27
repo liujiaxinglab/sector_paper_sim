@@ -16,7 +16,6 @@ RULES_VERSION = "2.0.0"
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 _WORKSPACE_ROOT = _REPO_ROOT.parent
-_RULES_PATH = _REPO_ROOT / "project_content" / "docs" / "01_撮合与切换确定性规则.md"
 
 
 def canonical_json_bytes(payload: Mapping[str, Any]) -> bytes:
@@ -87,11 +86,7 @@ def current_program_identity() -> dict[str, str]:
         "version": version,
         "commit": commit,
         "source_sha256": digest.hexdigest(),
-        "rules_sha256": (
-            sha256_file(_RULES_PATH)
-            if _RULES_PATH.is_file()
-            else sha256_bytes(RULES_VERSION.encode("utf-8"))
-        ),
+        "rules_sha256": sha256_bytes(RULES_VERSION.encode("utf-8")),
     }
 
 
@@ -233,7 +228,6 @@ def validate_resume_manifest(
         "simulation_start_date",
         "initial_capital",
         "account_strategy_config_summary",
-        "config_sha256",
         "program_version",
         "program_commit",
         "program_source_sha256",
@@ -245,12 +239,13 @@ def validate_resume_manifest(
         for field in immutable_fields
         if saved.get(field) != current.get(field)
     ]
-    if saved.get("config_sha256") != current.get("config_sha256"):
+    if saved.get("account_strategy_config_summary") != current.get("account_strategy_config_summary"):
         changed_config = _changed_paths(
-            saved.get("config_snapshot", {}), current.get("config_snapshot", {})
+            saved.get("account_strategy_config_summary", {}),
+            current.get("account_strategy_config_summary", {}),
         )
         if changed_config:
-            differences.append("config fields changed: " + ", ".join(changed_config))
+            differences.append("core config fields changed: " + ", ".join(changed_config))
     if differences:
         raise ValueError(
             "Experiment manifest mismatch; refusing to resume. " + "; ".join(differences)
