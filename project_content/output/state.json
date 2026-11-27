@@ -1,18 +1,18 @@
 {
   "schema_version": "2.0.0",
   "start_date": "2026-11-23",
-  "last_processed_date": "2026-11-26",
+  "last_processed_date": "2026-11-27",
   "last_known_closes": {
-    "159330.SZ": 1.227,
-    "159622.SZ": 1.062,
-    "510720.SH": 1.007,
-    "512400.SH": 1.233,
-    "512480.SH": 0.696,
-    "512880.SH": 0.943,
-    "515790.SH": 0.619
+    "159330.SZ": 1.288,
+    "159622.SZ": 1.12,
+    "510720.SH": 1.003,
+    "512400.SH": 1.31,
+    "512480.SH": 0.766,
+    "512880.SH": 1.006,
+    "515790.SH": 0.661
   },
   "routing_checkpoint": {
-    "verified_through_date": "2026-11-26",
+    "verified_through_date": "2026-11-27",
     "verified_replay_through_date": "2026-11-26",
     "verified_replay_dates": [
       "2026-11-23",
@@ -114,35 +114,35 @@
       "symbol_states": {}
     },
     "B2": {
-      "cash": 46473.42272674298,
-      "equity": 99787.42272674298,
-      "nav": 0.9978742272674298,
-      "peak_equity": 101021.5477,
+      "cash": 59484.673687696886,
+      "equity": 102626.37368769688,
+      "nav": 1.0262637368769687,
+      "peak_equity": 102626.37368769688,
       "max_drawdown": -0.012311983697240403,
-      "next_trade_id": 19,
+      "next_trade_id": 27,
       "positions": {
         "159622.SZ": {
-          "shares": 6100,
+          "shares": 4100,
           "avg_cost": 1.0212042000000001
         },
         "510720.SH": {
-          "shares": 8200,
-          "avg_cost": 1.0050416427148874
+          "shares": 10200,
+          "avg_cost": 1.0025012848974437
         },
         "512400.SH": {
-          "shares": 6800,
+          "shares": 5100,
           "avg_cost": 1.2367473
         },
         "512480.SH": {
-          "shares": 14300,
+          "shares": 11300,
           "avg_cost": 0.7234047637227202
         },
         "512880.SH": {
-          "shares": 12800,
+          "shares": 6400,
           "avg_cost": 0.9715956325258027
         },
         "515790.SH": {
-          "shares": 13200,
+          "shares": 9900,
           "avg_cost": 0.6291258
         }
       },
@@ -185,10 +185,10 @@
                 "shares": 0
               },
               {
-                "side": "SELL",
-                "level": 2,
-                "price": 1.095084154589372,
-                "shares": 2000
+                "side": "BUY",
+                "level": 1,
+                "price": 1.058042077294686,
+                "shares": 0
               },
               {
                 "side": "SELL",
@@ -231,10 +231,10 @@
                 "shares": 0
               },
               {
-                "side": "BUY",
-                "level": -1,
-                "price": 0.9918874403578529,
-                "shares": 0
+                "side": "SELL",
+                "level": 0,
+                "price": 1.008,
+                "shares": 2000
               },
               {
                 "side": "SELL",
@@ -295,10 +295,10 @@
                 "shares": 0
               },
               {
-                "side": "SELL",
-                "level": 1,
-                "price": 1.2879,
-                "shares": 1700
+                "side": "BUY",
+                "level": 0,
+                "price": 1.242,
+                "shares": 0
               },
               {
                 "side": "SELL",
@@ -347,10 +347,10 @@
                 "shares": 0
               },
               {
-                "side": "SELL",
-                "level": 0,
-                "price": 0.732,
-                "shares": 3000
+                "side": "BUY",
+                "level": -1,
+                "price": 0.6903398657718121,
+                "shares": 0
               },
               {
                 "side": "SELL",
@@ -399,22 +399,22 @@
                 "shares": 0
               },
               {
-                "side": "SELL",
+                "side": "BUY",
+                "level": -2,
+                "price": 0.9461345565749235,
+                "shares": 0
+              },
+              {
+                "side": "BUY",
                 "level": -1,
                 "price": 0.9630672782874617,
-                "shares": 2200
+                "shares": 0
               },
               {
-                "side": "SELL",
+                "side": "BUY",
                 "level": 0,
                 "price": 0.98,
-                "shares": 2100
-              },
-              {
-                "side": "SELL",
-                "level": 1,
-                "price": 0.9969327217125382,
-                "shares": 2100
+                "shares": 0
               },
               {
                 "side": "SELL",
@@ -469,10 +469,10 @@
                 "shares": 0
               },
               {
-                "side": "SELL",
-                "level": 1,
-                "price": 0.6522779527559055,
-                "shares": 3300
+                "side": "BUY",
+                "level": 0,
+                "price": 0.629,
+                "shares": 0
               },
               {
                 "side": "SELL",
@@ -499,9 +499,9 @@
     },
     "C": {
       "cash": 180.94017999998687,
-      "equity": 98801.04018,
-      "nav": 0.9880104018,
-      "peak_equity": 102049.14017999999,
+      "equity": 104481.04018,
+      "nav": 1.0448104018,
+      "peak_equity": 104481.04018,
       "max_drawdown": -0.03203456681980632,
       "next_trade_id": 7,
       "positions": {
@@ -553,9 +553,9 @@
     },
     "D": {
       "cash": 68.5176999999967,
-      "equity": 99332.8177,
-      "nav": 0.993328177,
-      "peak_equity": 101193.5177,
+      "equity": 104267.7177,
+      "nav": 1.0426771769999998,
+      "peak_equity": 104267.7177,
       "max_drawdown": -0.01838754143833854,
       "next_trade_id": 2,
       "positions": {
@@ -573,5 +573,5 @@
   },
   "experiment_id": "exp-4e9b5ec996a109c43318",
   "experiment_manifest_sha256": "d0b4ce879ae50aa1bff0327c1c0387dc56d396376df3b2525c2305bb9dd58115",
-  "daily_input_manifest_chain_sha256": "6706037b36122eb6c2113c5c47b24ac064ac01264ddbc064bf51cef89faa8c69"
+  "daily_input_manifest_chain_sha256": "38c2ccb94f30030e872d2073d985d4bf81a082d73396493d64d96ccd48467a27"
 }
