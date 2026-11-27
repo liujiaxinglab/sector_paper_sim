@@ -1,6 +1,6 @@
 {
   "schema_version": "1.0.0",
-  "experiment_id": "exp-1998c33d3a86e31827ab",
+  "experiment_id": "exp-4e9b5ec996a109c43318",
   "run_date": "2026-11-24",
   "trade_date": "2026-11-24",
   "run_mode": "replay",
@@ -81,7 +81,7 @@
     "watchlist": {
       "path": "sector_radar/project_content/config/watchlist.json",
       "file_name": "watchlist.json",
-      "sha256": "469143068a15d498ddf392b80abb4342a9dc1834ec9fc47f3f4c86f892ca841a"
+      "sha256": "95f60f22076e0f375c70728a5104b578e3297a8032024ad1e3d84e1f038147c4"
     }
   }
 }
