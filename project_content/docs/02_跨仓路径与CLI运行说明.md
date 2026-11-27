@@ -44,14 +44,16 @@
 # 1. 查看帮助与参数
 python project_content/src/run_daily_sim.py --help
 
-# 2. 历史重放演练（读取 BACKFILL 初始化区间，不写磁盘）
-python project_content/src/run_daily_sim.py --mode replay --from-scratch --as-of 2026-11-25 --dry-run
+# 2. 历史重放只读演练（BACKFILL 初始化区间；from-scratch 使用隔离空目录）
+$drillOutput = Join-Path $env:TEMP ("paper-sim-replay-" + [guid]::NewGuid().ToString("N"))
+python project_content/src/run_daily_sim.py --mode replay --from-scratch --as-of 2026-11-25 --output-dir "$drillOutput" --dry-run
 
 # 3. 独立临时目录从头重放（保留正式 output/ 不被改动）
 python project_content/src/run_daily_sim.py --mode replay --from-scratch --as-of 2026-11-26 --output-dir <临时输出目录>
 
-# 4. 正式前瞻期日频增量推进（在 sector_radar 完成当日同步与看板后调用）
-python project_content/src/run_daily_sim.py
+# 4. 正式前瞻期日频增量推进（阶段 2 主控终审通过后；使用外部宿主从 BS-01 确认并设置的 $targetDate）
+python project_content/src/run_daily_sim.py --mode formal --as-of $targetDate
+if ($LASTEXITCODE -ne 0) { throw 'Paper Sim daily step failed; stop this run' }
 
 # 5. 从仓库根目录运行全量离线与只读回归测试
 python -m pytest -q
@@ -65,3 +67,10 @@ python -m pytest -q
   python -m pytest -q -c "<工作区父目录>/sector_paper_sim/pyproject.toml" --rootdir "<工作区父目录>/sector_paper_sim" "<工作区父目录>/sector_paper_sim/project_content/tests"
   ```
 - **跨仓日频协同顺序**：先在 `sector_radar` 执行 `--sync-watchlist-regime`（若有当日生效路由切换）与 `run_daily_board.py`，确认 `regime_history.json` 与 `QuantData` 就绪后，再在 `sector_paper_sim` 执行 `run_daily_sim.py`。本仓不创建或修改 Windows 计划任务；外部调度器只需激活环境、设置工作目录并调用上述入口。
+
+### 2.4 阶段门禁与异常停机
+
+- 阶段 3 正式运行仅在本仓 `status.md` 明确记录阶段 2 主控终审通过、且 Radar `status.md` 记录阶段 5 联合验收通过后启用；此前仅做 `--dry-run` / `replay` 只读核验，不更新正式 `output/`。
+- 外部宿主按同一 `BS-01` 目标交易日顺序完成 QRI 刷新与台账核验、Radar 路由同步及看板，再调用 `python project_content/src/run_daily_sim.py --mode formal --as-of <targetDate>`。`formal` 只接受时序合格的 `LIVE` 记录；`BACKFILL` 仅用于 `replay` 初始化和历史重放。
+- 任一上游命令、台账覆盖/哈希核验、Radar 同步/看板或 Paper Sim 命令返回非零，立即停止本轮并保留已有快照；不得以 `--allow-lag`、历史 `BACKFILL` 或同日重跑绕过门禁。修复并确认数据和路由状态后再恢复运行。
+- `experiment_manifest`、每日输入版本或已有不可变快照冲突时按 CLI 错误停机；正式账本不得通过 `--from-scratch` 覆盖。全量重建或回放须改用隔离的 `--output-dir`。
