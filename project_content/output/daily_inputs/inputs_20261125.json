@@ -1,11 +1,11 @@
 {
   "schema_version": "1.0.0",
-  "experiment_id": "exp-806691e93bcded5fcd3c",
+  "experiment_id": "exp-1998c33d3a86e31827ab",
   "run_date": "2026-11-25",
   "trade_date": "2026-11-25",
   "run_mode": "replay",
   "allow_lag": false,
-  "forward_eval_start_date": null,
+  "forward_eval_start_date": "2026-11-27",
   "inputs": {
     "tdx_batches": [
       {
